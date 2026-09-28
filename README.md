@@ -12,23 +12,28 @@ O projeto usa somente a biblioteca padrão do Python; não é necessário instal
 
 ## Arquivos
 
-- `servidor.py`: recebe descoberta e requisições UDP, mantém os totais globais e o último estado processado de cada cliente identificado pelo IP.
-- `cliente.py`: descobre o servidor, lê inteiros positivos da entrada padrão e envia uma requisição por vez. A leitura, a rede e a saída são tratadas por threads separadas.
-- `protocolo.py`: codifica e decodifica as mensagens JSON UTF-8, incluindo a versão do protocolo.
-- `benchmark.py`: executa um benchmark stop-and-wait de 1 milhão de requisições, cada uma com valor 1.
+- `src/cliente.py`: coordena o cliente, lê inteiros positivos da entrada padrão e envia uma requisição por vez. A leitura, a rede e a saída são tratadas por threads separadas.
+- `src/servidor.py`: inicializa o socket UDP e coordena o recebimento de descobertas e requisições.
+- `src/descoberta.py`: implementa a descoberta ativa por broadcast no cliente e a resposta unicast do servidor.
+- `src/processamento.py`: implementa o envio e a espera por ACK no cliente, além da validação da sequência e da agregação no servidor.
+- `src/interface.py`: centraliza a formatação das mensagens exibidas pelo cliente e pelo servidor.
+- `src/protocolo.py`: codifica e decodifica as mensagens JSON UTF-8, incluindo a versão do protocolo.
+- `src/benchmark.py`: executa um benchmark stop-and-wait de 1 milhão de requisições, cada uma com valor 1.
+
+Os módulos de descoberta, processamento e interface são reutilizados pelos pontos de entrada do cliente e do servidor. `cliente.py` e `servidor.py` coordenam esses subserviços; `protocolo.py` define o formato das mensagens trocadas.
 
 ## Como executar
 
 Abra um terminal na pasta do projeto. Inicie o servidor informando a porta UDP:
 
 ```bash
-python3 servidor.py 4000
+python3 src/servidor.py 4000
 ```
 
 O servidor inicia com `num_reqs 0 total_sum 0`. Mantenha esse terminal aberto e, em outro terminal, inicie o cliente na mesma porta:
 
 ```bash
-python3 cliente.py 4000
+python3 src/cliente.py 4000
 ```
 
 Após descobrir o servidor, digite um inteiro positivo por linha. Não é necessário pressionar Ctrl+D entre valores. Para encerrar a entrada e deixar o cliente concluir as requisições já enfileiradas, use Ctrl+D em Linux/WSL. Ctrl+C interrompe o cliente. Para parar o servidor, use Ctrl+C no terminal dele.
@@ -36,7 +41,7 @@ Após descobrir o servidor, digite um inteiro positivo por linha. Não é necess
 O cliente também permite configurar o timeout em segundos. O padrão é 0,010 segundo:
 
 ```bash
-python3 cliente.py 4000 0.05
+python3 src/cliente.py 4000 0.05
 ```
 
 O servidor e o cliente devem usar a mesma porta. A porta representa a porta UDP de escuta do servidor; o cliente usa uma porta local efêmera.
@@ -67,13 +72,13 @@ O benchmark atual executa **1 milhão de requisições de um único cliente**. C
 Inicie um servidor novo e zerado em um terminal:
 
 ```bash
-python3 servidor.py 4000
+python3 src/servidor.py 4000
 ```
 
 Em outro terminal, execute:
 
 ```bash
-python3 benchmark.py 4000
+python3 src/benchmark.py 4000
 ```
 
 Como cada valor é 1, o resultado esperado ao final é `num_reqs 1000000` e `total_sum 1000000`. O benchmark informa progresso, taxa média, retransmissões e compara o ACK final com esses valores. Execute-o contra um servidor dedicado e zerado; um servidor que já processou requisições fará a comparação falhar.
