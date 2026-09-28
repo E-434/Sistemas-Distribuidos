@@ -7,23 +7,19 @@ import queue
 import socket
 import sys
 import threading
-from datetime import datetime
 from typing import Final
 
-from protocolo import (
-    TYPE_ACK,
-    TYPE_DISCOVER_ACK,
-    decode_message,
-    make_discover,
-    make_request,
+from descoberta import discover_server
+from interface import (
+    ack_received,
+    client_server_addr,
+    invalid_value,
+    request_resent,
+    request_sent,
 )
+from processamento import UINT64_MAX, send_request, wait_for_ack
 
-BUFFER_SIZE: Final[int] = 4096
-BROADCAST_ADDRESS: Final[str] = "255.255.255.255"
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 0.010
-DISCOVERY_TIMEOUT_SECONDS: Final[float] = 0.500
-DISCOVERY_RETRIES: Final[int] = 5
-UINT64_MAX: Final[int] = (1 << 64) - 1
 
 _SENTINEL = object()
 
@@ -62,42 +58,6 @@ class DistributedClient:
             daemon=True,
         )
 
-    @staticmethod
-    def now() -> str:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    def discover_server(self) -> str:
-        """Descobre o servidor via broadcast e retorna seu endereço IPv4."""
-        self.sock.settimeout(DISCOVERY_TIMEOUT_SECONDS)
-        discovery = make_discover()
-
-        for _ in range(DISCOVERY_RETRIES):
-            try:
-                self.sock.sendto(discovery, (BROADCAST_ADDRESS, self.port))
-            except OSError as exc:
-                raise RuntimeError(f"falha ao enviar descoberta: {exc}") from exc
-
-            while True:
-                try:
-                    data, sender = self.sock.recvfrom(BUFFER_SIZE)
-                except socket.timeout:
-                    break
-
-                message = decode_message(data)
-                if message is None:
-                    continue
-
-                if message.get("type") != TYPE_DISCOVER_ACK:
-                    continue
-
-                # O IP de origem do datagrama é o endereço que deve ser usado
-                # para enviar as requisições subsequentes.
-                server_ip = sender[0]
-                self.server_addr = (server_ip, self.port)
-                return server_ip
-
-        raise RuntimeError("nenhum servidor encontrado via broadcast")
-
     def _output_worker(self) -> None:
         while True:
             item = self.output_queue.get()
@@ -126,60 +86,14 @@ class DistributedClient:
             try:
                 value = int(line)
             except ValueError:
-                self.output_queue.put(f"{self.now()} invalid_value {line}")
+                self.output_queue.put(invalid_value(line))
                 continue
 
             if value <= 0 or value > UINT64_MAX:
-                self.output_queue.put(f"{self.now()} invalid_value {value}")
+                self.output_queue.put(invalid_value(value))
                 continue
 
             self.input_queue.put(value)
-
-    def _send_request(self, req_id: int, value: int) -> None:
-        assert self.server_addr is not None
-        packet = make_request(req_id=req_id, value=value)
-        self.sock.sendto(packet, self.server_addr)
-
-    def _wait_for_ack(self, req_id: int) -> dict | None:
-        """Espera o ACK da requisição atual, ignorando ACKs atrasados."""
-        assert self.server_addr is not None
-
-        while not self.stop_event.is_set():
-            try:
-                data, sender = self.sock.recvfrom(BUFFER_SIZE)
-            except socket.timeout:
-                return None
-            except OSError:
-                if self.stop_event.is_set():
-                    return None
-                raise
-
-            if sender[0] != self.server_addr[0]:
-                continue
-
-            message = decode_message(data)
-            if message is None or message.get("type") != TYPE_ACK:
-                continue
-
-            ack_id = message.get("id_req")
-            num_reqs = message.get("num_reqs")
-            total_sum = message.get("total_sum")
-
-            if not isinstance(ack_id, int):
-                continue
-            if not isinstance(num_reqs, int):
-                continue
-            if not isinstance(total_sum, int):
-                continue
-
-            # ACK menor significa que é uma resposta atrasada referente a uma
-            # requisição anterior. ACK maior é inconsistente com stop-and-wait.
-            if ack_id != req_id:
-                continue
-
-            return message
-
-        return None
 
     def _network_worker(self) -> None:
         assert self.server_addr is not None
@@ -203,7 +117,8 @@ class DistributedClient:
                 while not self.stop_event.is_set():
                     try:
                         self.sock.settimeout(self.timeout)
-                        self._send_request(current_id, value)
+                        assert self.server_addr is not None
+                        send_request(self.sock, self.server_addr, current_id, value)
                     except OSError:
                         if self.stop_event.is_set():
                             return
@@ -211,24 +126,30 @@ class DistributedClient:
 
                     if first_attempt:
                         self.output_queue.put(
-                            f"{self.now()} send server {self.server_addr[0]} "
-                            f"id_req {current_id} value {value}"
+                            request_sent(self.server_addr[0], current_id, value)
                         )
                         first_attempt = False
                     else:
-                        self.output_queue.put(
-                            f"{self.now()} resend id_req {current_id} value {value}"
-                        )
+                        self.output_queue.put(request_resent(current_id, value))
 
-                    ack = self._wait_for_ack(current_id)
+                    ack = wait_for_ack(
+                        self.sock,
+                        self.server_addr,
+                        current_id,
+                        self.stop_event,
+                    )
                     if ack is None:
                         # Timeout: reenvia exatamente a mesma requisição.
                         continue
 
                     self.output_queue.put(
-                        f"{self.now()} server {self.server_addr[0]} "
-                        f"id_req {current_id} value {value} "
-                        f"num_reqs {ack['num_reqs']} total_sum {ack['total_sum']}"
+                        ack_received(
+                            self.server_addr[0],
+                            current_id,
+                            value,
+                            ack["num_reqs"],
+                            ack["total_sum"],
+                        )
                     )
 
                     req_id += 1
@@ -238,17 +159,19 @@ class DistributedClient:
 
     def run(self) -> None:
         try:
-            server_ip = self.discover_server()
+            self.server_addr = discover_server(self.sock, self.port)
         except RuntimeError as exc:
             print(f"Erro: {exc}", file=sys.stderr)
             self.sock.close()
             return
 
+        server_ip = self.server_addr[0]
+
         # Primeiro publica server_addr; só depois inicia as threads que podem
         # produzir mensagens de envio. Assim a ordem exigida pela interface é
         # preservada.
         self.output_thread.start()
-        self.output_queue.put(f"{self.now()} server_addr {server_ip}")
+        self.output_queue.put(client_server_addr(server_ip))
 
         self.input_thread.start()
         self.network_thread.start()
