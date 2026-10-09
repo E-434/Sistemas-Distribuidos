@@ -1,5 +1,7 @@
 """Rotinas do subserviço de descoberta via broadcast UDP."""
 
+from __future__ import annotations
+
 import socket
 from typing import Final
 
@@ -11,7 +13,11 @@ from protocolo import (
 )
 
 BUFFER_SIZE: Final[int] = 4096
-BROADCAST_ADDRESS: Final[str] = "255.255.255.255"
+# Inclui os endereços de broadcast global e de loopback local para funcionar na VM
+BROADCAST_ADDRESSES: Final[tuple[str, ...]] = (
+    "255.255.255.255",
+    "127.255.255.255",
+)
 DISCOVERY_TIMEOUT_SECONDS: Final[float] = 0.500
 DISCOVERY_RETRIES: Final[int] = 5
 
@@ -22,10 +28,12 @@ def discover_server(sock: socket.socket, port: int) -> tuple[str, int]:
     discovery = make_discover()
 
     for _ in range(DISCOVERY_RETRIES):
-        try:
-            sock.sendto(discovery, (BROADCAST_ADDRESS, port))
-        except OSError as exc:
-            raise RuntimeError(f"falha ao enviar descoberta: {exc}") from exc
+        # Tenta enviar para o broadcast da LAN e do loopback local
+        for broadcast_ip in BROADCAST_ADDRESSES:
+            try:
+                sock.sendto(discovery, (broadcast_ip, port))
+            except OSError:
+                continue
 
         while True:
             try:
