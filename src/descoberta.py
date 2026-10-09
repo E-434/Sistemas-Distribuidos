@@ -28,7 +28,6 @@ def discover_server(sock: socket.socket, port: int) -> tuple[str, int]:
     discovery = make_discover()
 
     for _ in range(DISCOVERY_RETRIES):
-        # Tenta enviar para o broadcast da LAN e do loopback local
         for broadcast_ip in BROADCAST_ADDRESSES:
             try:
                 sock.sendto(discovery, (broadcast_ip, port))
@@ -45,7 +44,12 @@ def discover_server(sock: socket.socket, port: int) -> tuple[str, int]:
             if message is None or message.get("type") != TYPE_DISCOVER_ACK:
                 continue
 
-            return sender[0], port
+            # Garante o uso de 127.0.0.1 quando o teste for executado em loopback
+            server_ip = message.get("server_addr") or sender[0]
+            if sender[0] == "127.0.0.1":
+                server_ip = "127.0.0.1"
+
+            return server_ip, port
 
     raise RuntimeError("nenhum servidor encontrado via broadcast")
 
@@ -54,15 +58,19 @@ def respond_to_discovery(
     sock: socket.socket,
     sender: tuple[str, int],
 ) -> None:
-    """Responde unicast à descoberta usando o endereço local da interface."""
+    """Responde unicast à descoberta usando o endereço local correto da interface."""
     client_ip, client_port = sender
-    temp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        temp.connect((client_ip, 1))
-        server_ip = temp.getsockname()[0]
-    except OSError:
-        server_ip = "0.0.0.0"
-    finally:
-        temp.close()
+
+    if client_ip == "127.0.0.1":
+        server_ip = "127.0.0.1"
+    else:
+        temp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            temp.connect((client_ip, 1))
+            server_ip = temp.getsockname()[0]
+        except OSError:
+            server_ip = "0.0.0.0"
+        finally:
+            temp.close()
 
     sock.sendto(make_discover_ack(server_ip), (client_ip, client_port))
