@@ -30,7 +30,9 @@ class AggregationServer:
         self.processor = RequestProcessor()
 
     def process_discovery(self, sender: tuple[str, int]) -> None:
-        self.processor.register_client(sender[0])
+        # Usa IP:Porta para diferençar clientes rodando no mesmo IP (VM / Loopback)
+        client_key = f"{sender[0]}:{sender[1]}"
+        self.processor.register_client(client_key)
         respond_to_discovery(self.sock, sender)
 
     def process_request(self, message: dict, sender: tuple[str, int]) -> None:
@@ -93,4 +95,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
