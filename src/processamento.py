@@ -1,199 +1,103 @@
-"""Lógica de envio e processamento de requisições do serviço de soma."""
+#!/usr/bin/env python3
+"""
+Protocolo de aplicação do trabalho prático.
 
-from __future__ import annotations
+As quatro mensagens são transportadas exclusivamente por UDP:
+  1. DESCOBERTA      (cliente -> broadcast)
+  2. DESCOBERTA_ACK  (servidor -> unicast)
+  3. REQUISICAO       (cliente -> servidor)
+  4. ACK              (servidor -> cliente)
 
-import ctypes
-import socket
-import threading
-from dataclasses import dataclass
-from typing import Final
+Formato: JSON UTF-8.
+"""
 
-from protocolo import (
-    STATUS_DUPLICATE,
-    STATUS_OUT_OF_ORDER,
-    STATUS_PROCESSED,
-    TYPE_ACK,
-    decode_message,
-    make_ack,
-    make_request,
-)
+import json
 
-UINT64_MAX: Final[int] = (1 << 64) - 1
-BUFFER_SIZE: Final[int] = 4096
+PROTOCOL_VERSION = 1
+MAX_DATAGRAM_SIZE = 4096
 
+# Os tipos identificam as etapas de descoberta e de envio de valores.
+TYPE_DISCOVER = "DISCOVER"
+TYPE_DISCOVER_ACK = "DISCOVER_ACK"
+TYPE_REQUEST = "REQUEST"
+TYPE_ACK = "ACK"
 
-@dataclass
-class ClientState:
-    """Estado da última requisição processada de um cliente."""
-
-    last_req: int = 0
-    last_num_reqs: int = 0
-    last_total_sum: int = 0
-    last_value: int = 0
+STATUS_PROCESSED = "PROCESSED"
+STATUS_DUPLICATE = "DUPLICATE"
+STATUS_OUT_OF_ORDER = "OUT_OF_ORDER"
 
 
-@dataclass(frozen=True)
-class ProcessingEvent:
-    """Dados necessários para a interface relatar o resultado do servidor."""
-
-    kind: str
-    client_ip: str
-    req_id: int
-    value: int
-    num_reqs: int
-    total_sum: int
-    expected: int = 0
-    last_req: int = 0
+def encode_message(message: dict) -> bytes:
+    """Serializa uma mensagem para JSON UTF-8."""
+    message = dict(message)
+    # Inclui a versão por padrão para que o receptor possa validar o formato.
+    message.setdefault("version", PROTOCOL_VERSION)
+    return json.dumps(
+        message,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
-class RequestProcessor:
-    """Mantém os acumuladores e decide como responder às requisições."""
+def decode_message(data: bytes) -> dict | None:
+    """Desserializa e valida minimamente uma mensagem recebida."""
+    # Descarta datagramas vazios ou maiores que o limite do protocolo.
+    if not data or len(data) > MAX_DATAGRAM_SIZE:
+        return None
 
-    def __init__(self) -> None:
-        self.num_reqs = ctypes.c_uint64(0)
-        self.total_sum = ctypes.c_uint64(0)
-        self.clients: dict[str, ClientState] = {}
+    try:
+        message = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
 
-    def register_client(self, address: str) -> ClientState:
-        state = self.clients.get(address)
-        if state is None:
-            state = ClientState()
-            self.clients[address] = state
-        return state
+    if not isinstance(message, dict):
+        return None
 
-    @staticmethod
-    def validate_uint64(value: int, field_name: str) -> None:
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise ValueError(f"{field_name} deve ser inteiro")
-        if value < 0 or value > UINT64_MAX:
-            raise ValueError(f"{field_name} fora do intervalo uint64")
+    if message.get("version") != PROTOCOL_VERSION:
+        return None
 
-    def process_request(
-        self,
-        message: dict,
-        sender: tuple[str, int],
-    ) -> tuple[bytes | None, ProcessingEvent | None]:
-        client_ip, _ = sender
-        state = self.register_client(client_ip)
-        req_id = message.get("id_req")
-        value = message.get("value")
+    if not isinstance(message.get("type"), str):
+        return None
 
-        try:
-            self.validate_uint64(req_id, "id_req")
-            self.validate_uint64(value, "value")
-        except ValueError:
-            return None, None
-
-        expected = state.last_req + 1
-        if req_id == expected:
-            if int(self.total_sum.value) > UINT64_MAX - value:
-                return None, None
-
-            self.total_sum.value = int(self.total_sum.value) + value
-            self.num_reqs.value = int(self.num_reqs.value) + 1
-            state.last_req = req_id
-            state.last_num_reqs = int(self.num_reqs.value)
-            state.last_total_sum = int(self.total_sum.value)
-            state.last_value = value
-
-            response = make_ack(
-                req_id=state.last_req,
-                num_reqs=state.last_num_reqs,
-                total_sum=state.last_total_sum,
-                status=STATUS_PROCESSED,
-            )
-            event = ProcessingEvent(
-                STATUS_PROCESSED,
-                client_ip,
-                req_id,
-                value,
-                state.last_num_reqs,
-                state.last_total_sum,
-            )
-            return response, event
-
-        if req_id <= state.last_req:
-            response = make_ack(
-                req_id=state.last_req,
-                num_reqs=state.last_num_reqs,
-                total_sum=state.last_total_sum,
-                status=STATUS_DUPLICATE,
-            )
-            event = ProcessingEvent(
-                STATUS_DUPLICATE,
-                client_ip,
-                req_id,
-                value,
-                state.last_num_reqs,
-                state.last_total_sum,
-                last_req=state.last_req,
-            )
-            return response, event
-
-        response = make_ack(
-            req_id=state.last_req,
-            num_reqs=state.last_num_reqs,
-            total_sum=state.last_total_sum,
-            status=STATUS_OUT_OF_ORDER,
-        )
-        event = ProcessingEvent(
-            STATUS_OUT_OF_ORDER,
-            client_ip,
-            req_id,
-            value,
-            state.last_num_reqs,
-            state.last_total_sum,
-            expected=expected,
-            last_req=state.last_req,
-        )
-        return response, event
+    return message
 
 
-def send_request(
-    sock: socket.socket,
-    server_addr: tuple[str, int],
+def make_discover() -> bytes:
+    return encode_message({"type": TYPE_DISCOVER})
+
+
+def make_discover_ack(server_addr: str) -> bytes:
+    return encode_message(
+        {
+            "type": TYPE_DISCOVER_ACK,
+            "server_addr": server_addr,
+        }
+    )
+
+
+def make_request(req_id: int, value: int) -> bytes:
+    return encode_message(
+        {
+            "type": TYPE_REQUEST,
+            "id_req": req_id,
+            "value": value,
+        }
+    )
+
+
+def make_ack(
     req_id: int,
-    value: int,
-) -> None:
-    sock.sendto(make_request(req_id=req_id, value=value), server_addr)
+    num_reqs: int,
+    total_sum: int,
+    status: str,
+) -> bytes:
+    return encode_message(
+        {
+            "type": TYPE_ACK,
+            "id_req": req_id,
+            "num_reqs": num_reqs,
+            "total_sum": total_sum,
+            "status": status,
+        }
+    )
 
-
-def wait_for_ack(
-    sock: socket.socket,
-    server_addr: tuple[str, int],
-    req_id: int,
-    stop_event: threading.Event,
-) -> dict | None:
-    """Aguarda o ACK da requisição atual, descartando respostas incompatíveis."""
-    while not stop_event.is_set():
-        try:
-            data, sender = sock.recvfrom(BUFFER_SIZE)
-        except socket.timeout:
-            return None
-        except OSError:
-            if stop_event.is_set():
-                return None
-            raise
-
-        if sender[0] != server_addr[0]:
-            continue
-
-        message = decode_message(data)
-        if message is None or message.get("type") != TYPE_ACK:
-            continue
-
-        ack_id = message.get("id_req")
-        num_reqs = message.get("num_reqs")
-        total_sum = message.get("total_sum")
-        if not isinstance(ack_id, int):
-            continue
-        if not isinstance(num_reqs, int):
-            continue
-        if not isinstance(total_sum, int):
-            continue
-        if ack_id != req_id:
-            continue
-
-        return message
-
-    return None
