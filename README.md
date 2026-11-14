@@ -1,86 +1,144 @@
 # Serviço distribuído de soma sobre UDP
 
-Implementação em Python 3 de um serviço de soma distribuído. O servidor recebe valores de clientes, soma cada requisição aceita uma única vez e mantém os totais em memória.
+Implementação em Python 3.10+ do canal externo cliente-front-end para um
+serviço de soma. O front-end atende os clientes, atribui um `seq_id` global e
+responde com o total acumulado. O front-end dissemina cada operação aceita
+por multicast para os Replica Managers, que validam e confirmam apenas o
+recebimento. **Não há aplicação da soma nos RMs, replicação ativa, quórum de
+processamento ou eleição em anel**. O FE continua calculando a resposta com
+seu acumulador local, sem tolerância a falhas.
 
-## Requisitos
-
-- Python 3.10 ou superior.
-- Rede IPv4 com suporte a broadcast para a descoberta automática.
-- Cliente e servidor devem conseguir trocar datagramas UDP. Para a descoberta por broadcast, execute-os no mesmo segmento de rede.
-
-O projeto usa somente a biblioteca padrão do Python; não é necessário instalar dependências externas. Em uma máquina Windows, os comandos abaixo podem ser executados em uma distribuição WSL, como Ubuntu.
+O projeto usa somente a biblioteca padrão do Python e pode ser executado em
+Linux/Unix. Não há dependência de APIs específicas do Windows.
 
 ## Arquivos
 
-- `src/cliente.py`: coordena o cliente, lê inteiros positivos da entrada padrão e envia uma requisição por vez. A leitura, a rede e a saída são tratadas por threads separadas.
-- `src/servidor.py`: inicializa o socket UDP e coordena o recebimento de descobertas e requisições.
-- `src/descoberta.py`: implementa a descoberta ativa por broadcast no cliente e a resposta unicast do servidor.
-- `src/processamento.py`: implementa o envio e a espera por ACK no cliente, além da validação da sequência e da agregação no servidor.
-- `src/interface.py`: centraliza a formatação das mensagens exibidas pelo cliente e pelo servidor.
-- `src/protocolo.py`: codifica e decodifica as mensagens JSON UTF-8, incluindo a versão do protocolo.
-- `src/benchmark.py`: executa um benchmark stop-and-wait de 1 milhão de requisições, cada uma com valor 1.
+- `src/cliente.py`: gera um `client_id`, descobre o front-end e envia operações
+  stop-and-wait com `request_id`.
+- `src/servidor.py`: front-end UDP; sequencia operações, dissemina multicast,
+  monitora membership e agrega métricas de ACKs de recebimento.
+- `src/replica_manager.py`: processo UDP independente de Replica Manager;
+  registra-se no FE, recebe multicast, valida sequências e confirma recebimento
+  sem executar operações.
+- `src/descoberta.py`: descoberta do front-end por broadcast e resposta unicast.
+- `src/processamento.py`: sequenciamento global, idempotência por cliente e
+  acumulador temporário da configuração sem réplicas.
+- `src/protocolo.py`: mensagens versionadas para os canais externo e
+  intra-cluster, incluindo operações multicast, ACKs de recebimento e heartbeat.
+- `src/arquitetura.py`: identidades, descritores e estado de membership da
+  topologia do cluster.
+- `src/interface.py`: formatação dos logs com identificação do front-end e
+  `seq_id`.
+- `src/benchmark.py` e `src/Benchmark_file.py`: benchmarks usando o mesmo
+  protocolo cliente-front-end.
+- `RELATORIO_EVOLUCAO_ARQUITETURAL.md`: mapeamento detalhado da refatoração da
+  Parte 1 para esta etapa da Parte 2.
 
-Os módulos de descoberta, processamento e interface são reutilizados pelos pontos de entrada do cliente e do servidor. `cliente.py` e `servidor.py` coordenam esses subserviços; `protocolo.py` define o formato das mensagens trocadas.
+## Execução
 
-## Como executar
-
-Abra um terminal na pasta do projeto. Inicie o servidor informando a porta UDP:
+Inicie o front-end:
 
 ```bash
 python3 src/servidor.py 4000
 ```
 
-O servidor inicia com `num_reqs 0 total_sum 0`. Mantenha esse terminal aberto e, em outro terminal, inicie o cliente na mesma porta:
+Inicie um ou mais Replica Managers em terminais separados. Cada processo
+precisa de um identificador único e deve escutar na porta multicast
+configurada. No mesmo host, o socket UDP reutiliza a porta do grupo:
+
+```bash
+python3 src/replica_manager.py rm-1 5001 127.0.0.1 4000
+python3 src/replica_manager.py rm-2 5001 127.0.0.1 4000
+```
+
+O FE registra cada RM e acompanha seus heartbeats. O RM recebe operações por
+multicast e envia ACK confirmando o recebimento válido; ele não calcula nem
+mantém cópia do acumulador.
+
+Em outro terminal, inicie o cliente:
 
 ```bash
 python3 src/cliente.py 4000
 ```
 
-Após descobrir o servidor, digite um inteiro positivo por linha. Não é necessário pressionar Ctrl+D entre valores. Para encerrar a entrada e deixar o cliente concluir as requisições já enfileiradas, use Ctrl+D em Linux/WSL. Ctrl+C interrompe o cliente. Para parar o servidor, use Ctrl+C no terminal dele.
-
-O cliente também permite configurar o timeout em segundos. O padrão é 0,010 segundo:
+Digite inteiros positivos, um por linha. Ctrl+D encerra a entrada depois de
+processar a fila; Ctrl+C interrompe o cliente. Para encerrar o front-end, use
+Ctrl+C no terminal correspondente. O timeout do cliente pode ser configurado
+em segundos:
 
 ```bash
 python3 src/cliente.py 4000 0.05
 ```
 
-O servidor e o cliente devem usar a mesma porta. A porta representa a porta UDP de escuta do servidor; o cliente usa uma porta local efêmera.
+## Protocolo e estado
 
-## Protocolo e processamento
+Os datagramas são objetos JSON UTF-8 com `version: 2`.
 
-As mensagens são objetos JSON UTF-8 transportados por UDP:
+1. `DISCOVER_FRONTEND`: cliente anuncia seu `client_id` por broadcast.
+2. `FRONTEND_INFO`: o front-end responde unicast com identidade e endereço.
+3. `SUM_REQUEST`: inclui `client_id`, `request_id` e `value`.
+4. `SUM_RESULT`: inclui o `seq_id` global, estado acumulado e status.
+5. `ORDERED_REQUEST`: o FE envia por multicast o `seq_id` e os dados da
+   operação aos RMs.
+6. `REPLICA_RECEIPT_ACK`: RM confirma recebimento e validação estrutural; não
+   confirma execução da soma.
+7. `REPLICA_HEARTBEAT`: RM informa atividade ao FE para atualizar membership.
 
-1. `DISCOVER`: o cliente envia a descoberta por broadcast.
-2. `DISCOVER_ACK`: o servidor responde por unicast e registra o IP do cliente.
-3. `REQUEST`: contém `id_req` e `value`.
-4. `ACK`: informa `id_req`, `num_reqs`, `total_sum` e o status (`PROCESSED`, `DUPLICATE` ou `OUT_OF_ORDER`).
+O front-end só incrementa `seq_id` ao aceitar uma nova requisição na ordem
+esperada daquele cliente. Reenvios de `request_id` já processados são
+identificados como duplicatas e não alteram a soma. O `seq_id` é monotônico
+durante a vida do FE e é incluído no datagrama multicast.
 
-Cada cliente começa com o ID 1. O cliente opera em stop-and-wait: só envia o próximo valor após receber o ACK da requisição atual. Se o timeout expirar, retransmite a mesma requisição. O servidor usa o IP de origem para manter a sequência de cada cliente, descarta duplicatas sem somá-las novamente e informa o último estado processado quando recebe uma requisição repetida ou fora de ordem.
+O processo RM registra `node_id` e porta de escuta com `REPLICA_REGISTER`;
+o front-end confirma com `REPLICA_REGISTERED` e mantém membership em memória.
+`REPLICA_HEARTBEAT` atualiza a última atividade; nós sem heartbeat dentro do
+timeout configurado ficam `suspect` e deixam de ser alvos do multicast.
 
-O acumulador global e os estados dos clientes existem somente na memória do processo servidor. Reiniciar o servidor zera esses dados.
+Cada `ORDERED_REQUEST` inclui `seq_id`, `client_id`, `request_id` e `value`.
+O RM valida os campos e reporta lacunas, duplicatas ou sequências fora de
+ordem para observabilidade, mas não aplica a operação. `REPLICA_RECEIPT_ACK`
+confirma somente que o datagrama válido foi recebido. O FE conta ACKs por
+sequência e registra se a meta de recebimento foi atingida; essa métrica não
+condiciona nem valida o resultado enviado ao cliente.
 
-## Saída
+## Estado da implementação
 
-O servidor imprime o estado inicial e, para cada requisição nova, exibe data/hora, IP do cliente, ID, valor e totais atualizados. Requisições duplicadas e fora de ordem também são sinalizadas.
+A versão atual fornece os dois canais UDP e processos RM recebendo operações.
+O estado da soma continua local ao FE e é respondido sem esperar ACKs; não há
+quorum de processamento, recuperação de estado, failover ou eleição. O
+heartbeat apenas classifica membership e não promove líderes.
 
-O cliente exibe o IP descoberto, as mensagens de envio e reenvio e, após cada ACK aceito, os totais informados pelo servidor. Valores inválidos ou não positivos são rejeitados pelo cliente.
+### Parâmetros de cluster
+
+FE e RMs precisam usar o mesmo endereço e porta multicast:
+
+```bash
+python3 src/servidor.py 4000 \
+  --multicast-group 239.10.10.10 --multicast-port 5001 \
+  --heartbeat-interval 1 --heartbeat-timeout 4 \
+  --receipt-ack-timeout 0.5 --expected-replicas 2
+python3 src/replica_manager.py rm-1 5001 127.0.0.1 4000 \
+  --multicast-group 239.10.10.10 --multicast-port 5001 \
+  --heartbeat-interval 1
+```
+
+`--receipt-ack-quorum` configura uma meta de ACKs de **recebimento**. Se não
+informada (ou 0), a meta é maioria do número esperado; `--expected-replicas 0`
+usa o membership ativo no momento do envio. É apenas instrumentação e não
+representa um quórum de resultados computados.
 
 ## Benchmark
 
-O benchmark atual executa **1 milhão de requisições de um único cliente**. Como é stop-and-wait, ele aguarda um ACK antes de enviar cada requisição seguinte; não simula clientes concorrentes nem IPs diferentes.
-
-Inicie um servidor novo e zerado em um terminal:
+O benchmark padrão envia 1 milhão de requisições de valor 1:
 
 ```bash
 python3 src/servidor.py 4000
-```
-
-Em outro terminal, execute:
-
-```bash
 python3 src/benchmark.py 4000
 ```
 
-Como cada valor é 1, o resultado esperado ao final é `num_reqs 1000000` e `total_sum 1000000`. O benchmark informa progresso, taxa média, retransmissões e compara o ACK final com esses valores. Execute-o contra um servidor dedicado e zerado; um servidor que já processou requisições fará a comparação falhar.
+O resultado esperado em um front-end recém-iniciado é `num_reqs 1000000` e
+`total_sum 1000000`. O benchmark de arquivo aceita um caminho de números:
 
-O tempo medido não inclui a descoberta do servidor. A taxa também inclui os custos de comunicação UDP e processamento do servidor, inclusive a impressão e o flush de cada requisição.
+```bash
+python3 src/Benchmark_file.py 4000 src/RAND_NUM_1.txt
+```
