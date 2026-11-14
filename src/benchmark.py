@@ -16,8 +16,8 @@ esperado é:
     num_reqs  = 1_000_000
     total_sum = 1_000_000
 
-Se um ACK for perdido, a mesma requisição é retransmitida. Como o servidor
-faz deduplicação por id_req, ela não será somada duas vezes.
+Se a resposta for perdida, a mesma requisição é retransmitida. O front-end
+deduplica por client_id/request_id para não somá-la duas vezes.
 """
 
 from __future__ import annotations
@@ -25,19 +25,17 @@ from __future__ import annotations
 import socket
 import sys
 import time
+import uuid
 from typing import Final
 
+from descoberta import discover_frontend
 from protocolo import (
-    TYPE_ACK,
-    TYPE_DISCOVER_ACK,
+    TYPE_SUM_RESULT,
     decode_message,
-    make_discover,
-    make_request,
+    make_sum_request,
 )
 
 BUFFER_SIZE: Final[int] = 4096
-BROADCAST_ADDRESS: Final[str] = "255.255.255.255"
-DISCOVERY_TIMEOUT: Final[float] = 0.5
 REQUEST_TIMEOUT: Final[float] = 0.100
 
 # Um valor fixo facilita comparar execuções do benchmark.
@@ -49,58 +47,30 @@ def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def discover_server(sock: socket.socket, port: int) -> str:
-    """Descobre o servidor via broadcast."""
-    sock.settimeout(DISCOVERY_TIMEOUT)
-    packet = make_discover()
-
-    for _ in range(5):
-        sock.sendto(packet, (BROADCAST_ADDRESS, port))
-
-        while True:
-            try:
-                data, sender = sock.recvfrom(BUFFER_SIZE)
-            except socket.timeout:
-                break
-
-            message = decode_message(data)
-            if message is None:
-                continue
-
-            if message.get("type") != TYPE_DISCOVER_ACK:
-                continue
-
-            # Usa o IP real de origem do ACK.
-            return sender[0]
-
-    raise RuntimeError("nenhum servidor encontrado via broadcast")
-
-
 def wait_for_ack(
     sock: socket.socket,
-    server_ip: str,
-    port: int,
-    req_id: int,
-) -> dict:
-    """Espera o ACK correspondente ao req_id."""
+    frontend_addr: tuple[str, int],
+    client_id: str,
+    request_id: int,
+) -> dict | None:
+    """Espera o resultado correspondente ao request_id."""
     while True:
         try:
             data, sender = sock.recvfrom(BUFFER_SIZE)
         except socket.timeout:
             return None
 
-        if sender[0] != server_ip:
+        if sender[0] != frontend_addr[0]:
             continue
 
         message = decode_message(data)
-        if message is None or message.get("type") != TYPE_ACK:
+        if message is None or message.get("type") != TYPE_SUM_RESULT:
             continue
 
-        ack_id = message.get("id_req")
-        if not isinstance(ack_id, int):
-            continue
-
-        if ack_id == req_id:
+        if (
+            message.get("client_id") == client_id
+            and message.get("request_id") == request_id
+        ):
             return message
 
         # ACKs antigos podem chegar atrasados.
@@ -126,12 +96,13 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    client_id = uuid.uuid4().hex
 
     try:
-        server_ip = discover_server(sock, port)
-        server_addr = (server_ip, port)
+        server_addr, frontend_id = discover_frontend(sock, port, client_id)
+        server_ip = server_addr[0]
 
-        print(f"{now()} server_addr {server_ip}")
+        print(f"{now()} frontend_addr {server_ip} frontend_id {frontend_id}")
         print(f"Benchmark: {NUM_REQUESTS:,} requisições, value={VALUE}")
         print("O servidor deve ter sido iniciado zerado.")
         print()
@@ -144,13 +115,13 @@ def main() -> None:
         retransmissions = 0
 
         for req_id in range(1, NUM_REQUESTS + 1):
-            packet = make_request(req_id, VALUE)
+            packet = make_sum_request(client_id, req_id, VALUE)
 
             while True:
                 sock.settimeout(REQUEST_TIMEOUT)
                 sock.sendto(packet, server_addr)
 
-                ack = wait_for_ack(sock, server_ip, port, req_id)
+                ack = wait_for_ack(sock, server_addr, client_id, req_id)
 
                 if ack is not None:
                     last_ack = ack

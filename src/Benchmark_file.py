@@ -18,19 +18,17 @@ import os
 import socket
 import sys
 import time
+import uuid
 from typing import Final, List, Optional
 
+from descoberta import discover_frontend
 from protocolo import (
-    TYPE_ACK,
-    TYPE_DISCOVER_ACK,
+    TYPE_SUM_RESULT,
     decode_message,
-    make_discover,
-    make_request,
+    make_sum_request,
 )
 
 BUFFER_SIZE: Final[int] = 4096
-BROADCAST_ADDRESS: Final[str] = "255.255.255.255"
-DISCOVERY_TIMEOUT: Final[float] = 0.5
 REQUEST_TIMEOUT: Final[float] = 0.100
 
 
@@ -62,61 +60,33 @@ def load_numbers_from_file(filepath: str) -> List[int]:
     return numbers
 
 
-def discover_server(sock: socket.socket, port: int) -> str:
-    """Descobre o servidor via broadcast."""
-    sock.settimeout(DISCOVERY_TIMEOUT)
-    packet = make_discover()
-
-    for _ in range(5):
-        sock.sendto(packet, (BROADCAST_ADDRESS, port))
-
-        while True:
-            try:
-                data, sender = sock.recvfrom(BUFFER_SIZE)
-            except socket.timeout:
-                break
-
-            message = decode_message(data)
-            if message is None:
-                continue
-
-            if message.get("type") != TYPE_DISCOVER_ACK:
-                continue
-
-            # Retorna o IP real de origem do servidor
-            return sender[0]
-
-    raise RuntimeError("Nenhum servidor encontrado via broadcast.")
-
-
 def wait_for_ack(
     sock: socket.socket,
-    server_ip: str,
-    port: int,
-    req_id: int,
+    frontend_addr: tuple[str, int],
+    client_id: str,
+    request_id: int,
 ) -> Optional[dict]:
-    """Espera o ACK correspondente ao req_id especificado."""
+    """Espera o resultado correspondente ao request_id especificado."""
     while True:
         try:
             data, sender = sock.recvfrom(BUFFER_SIZE)
         except socket.timeout:
             return None
 
-        if sender[0] != server_ip:
+        if sender[0] != frontend_addr[0]:
             continue
 
         message = decode_message(data)
-        if message is None or message.get("type") != TYPE_ACK:
+        if message is None or message.get("type") != TYPE_SUM_RESULT:
             continue
 
-        ack_id = message.get("id_req")
-        if not isinstance(ack_id, int):
-            continue
-
-        if ack_id == req_id:
+        if (
+            message.get("client_id") == client_id
+            and message.get("request_id") == request_id
+        ):
             return message
 
-        # Ignora ACKs antigos/atrasados
+        # Ignora respostas antigas/atrasadas.
         continue
 
 
@@ -144,12 +114,14 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    client_id = uuid.uuid4().hex
 
     try:
-        server_ip = discover_server(sock, port)
-        server_addr = (server_ip, port)
+        server_addr, frontend_id = discover_frontend(sock, port, client_id)
+        server_ip = server_addr[0]
 
         print(f"{now()} Servidor encontrado em {server_ip}:{port}")
+        print(f"Front-end: {frontend_id}")
         print(f"Benchmark: {total_requests:,} requisições a serem enviadas.")
         print(f"Soma esperada no conjunto de números: {expected_total_sum:,}")
         print("Nota: O servidor deve ter sido iniciado zerado para validação exata.")
@@ -163,13 +135,13 @@ def main() -> None:
         log_interval = max(1000, total_requests // 10)
 
         for req_id, value in enumerate(numbers, start=1):
-            packet = make_request(req_id, value)
+            packet = make_sum_request(client_id, req_id, value)
 
             while True:
                 sock.settimeout(REQUEST_TIMEOUT)
                 sock.sendto(packet, server_addr)
 
-                ack = wait_for_ack(sock, server_ip, port, req_id)
+                ack = wait_for_ack(sock, server_addr, client_id, req_id)
 
                 if ack is not None:
                     last_ack = ack

@@ -7,9 +7,10 @@ import queue
 import socket
 import sys
 import threading
+import uuid
 from typing import Final
 
-from descoberta import discover_server
+from descoberta import discover_frontend
 from interface import (
     ack_received,
     client_server_addr,
@@ -18,6 +19,7 @@ from interface import (
     request_sent,
 )
 from processamento import UINT64_MAX, send_request, wait_for_ack
+from protocolo import STATUS_DUPLICATE, STATUS_PROCESSED
 
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 0.010
 
@@ -28,14 +30,16 @@ class DistributedClient:
     def __init__(self, port: int, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> None:
         self.port = port
         self.timeout = timeout
+        self.client_id = uuid.uuid4().hex
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         # O cliente usa uma porta efêmera. A porta recebida na linha de comando
-        # é a porta UDP na qual o servidor está escutando.
+        # é a porta UDP na qual o front-end está escutando.
         self.server_addr: tuple[str, int] | None = None
+        self.frontend_id = ""
 
         # As filas separam leitura/escrita do terminal do trabalho de rede.
         self.stop_event = threading.Event()
@@ -97,7 +101,7 @@ class DistributedClient:
 
     def _network_worker(self) -> None:
         assert self.server_addr is not None
-        req_id = 1
+        request_id = 1
 
         try:
             while not self.stop_event.is_set():
@@ -110,7 +114,7 @@ class DistributedClient:
                     return
 
                 value = int(item)
-                current_id = req_id
+                current_id = request_id
                 first_attempt = True
 
                 # Stop-and-wait: só avança o id depois de receber o ACK atual.
@@ -118,7 +122,13 @@ class DistributedClient:
                     try:
                         self.sock.settimeout(self.timeout)
                         assert self.server_addr is not None
-                        send_request(self.sock, self.server_addr, current_id, value)
+                        send_request(
+                            self.sock,
+                            self.server_addr,
+                            self.client_id,
+                            current_id,
+                            value,
+                        )
                     except OSError:
                         if self.stop_event.is_set():
                             return
@@ -135,31 +145,44 @@ class DistributedClient:
                     ack = wait_for_ack(
                         self.sock,
                         self.server_addr,
+                        self.client_id,
                         current_id,
                         self.stop_event,
                     )
                     if ack is None:
                         # Timeout: reenvia exatamente a mesma requisição.
                         continue
+                    if ack.get("status") not in (STATUS_PROCESSED, STATUS_DUPLICATE):
+                        self.output_queue.put(
+                            f"frontend_error request_id {current_id} "
+                            f"status {ack.get('status')}"
+                        )
+                        self.stop_event.set()
+                        return
 
                     self.output_queue.put(
                         ack_received(
                             self.server_addr[0],
                             current_id,
                             value,
+                            ack["seq_id"],
                             ack["num_reqs"],
                             ack["total_sum"],
                         )
                     )
 
-                    req_id += 1
+                    request_id += 1
                     break
         except OSError:
             self.stop_event.set()
 
     def run(self) -> None:
         try:
-            self.server_addr = discover_server(self.sock, self.port)
+            self.server_addr, self.frontend_id = discover_frontend(
+                self.sock,
+                self.port,
+                self.client_id,
+            )
         except RuntimeError as exc:
             print(f"Erro: {exc}", file=sys.stderr)
             self.sock.close()
@@ -171,7 +194,7 @@ class DistributedClient:
         # produzir mensagens de envio. Assim a ordem exigida pela interface é
         # preservada.
         self.output_thread.start()
-        self.output_queue.put(client_server_addr(server_ip))
+        self.output_queue.put(client_server_addr(server_ip, self.frontend_id))
 
         self.input_thread.start()
         self.network_thread.start()
@@ -238,4 +261,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
