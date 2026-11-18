@@ -160,6 +160,40 @@ class RequestProcessor:
         return response, event
 
 
+class ReplicatedSumState:
+    """Máquina de estados determinística replicada em cada Replica Manager.
+
+    É a mesma computação do front-end (acumular `value` e contar requisições),
+    mas dirigida exclusivamente pela ordem total do `seq_id`. Como todos os nós
+    aplicam a MESMA sequência de operações na MESMA ordem, convergem para o
+    mesmo estado (replicação ativa / state-machine replication).
+
+    O front-end já deduplica por cliente/`request_id` antes de atribuir o
+    `seq_id`, então a réplica só precisa garantir ordem contígua: aplica
+    exatamente `last_applied_seq_id + 1`. Reentregas (retransmissões) de um
+    `seq_id` já aplicado são ignoradas de forma idempotente.
+    """
+
+    def __init__(self) -> None:
+        self.num_reqs = 0
+        self.total_sum = 0
+        self.last_applied_seq_id = 0
+
+    def apply(self, seq_id: int, value: int) -> bool:
+        """Aplica a operação se, e somente se, for a próxima da sequência.
+
+        Retorna True quando a soma foi efetivamente aplicada; False para
+        duplicatas (`seq_id` já aplicado) ou lacunas (`seq_id` futuro), que o
+        chamador deve tratar com o buffer de hold-back.
+        """
+        if seq_id != self.last_applied_seq_id + 1:
+            return False
+        self.num_reqs += 1
+        self.total_sum += value
+        self.last_applied_seq_id = seq_id
+        return True
+
+
 def send_request(
     sock: socket.socket,
     frontend_addr: tuple[str, int],
