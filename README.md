@@ -1,7 +1,7 @@
 # Serviço distribuído de soma sobre UDP com replicação ativa
 
 Implementação em Python 3.10+ de um serviço distribuído de soma sobre UDP com
-**replicação ativa** (state-machine replication). Todos os nós são iniciados
+**replicação ativa**. Todos os nós são iniciados
 pelo mesmo programa: cada servidor procura um front-end ativo; se encontrar,
 inicia como Replica Manager (RM); se não encontrar, usa uma eleição dummy que
 promove o próprio nó a front-end (FE).
@@ -13,9 +13,6 @@ na ordem do `seq_id`; como todos aplicam a mesma sequência de operações na me
 ordem, convergem para o mesmo estado. O FE só **confirma a operação ao cliente
 depois que um quórum de réplicas confirma a aplicação**. Entregas perdidas pelo
 UDP são recuperadas por hold-back + NACK/retransmissão.
-
-> A disseminação é por **unicast em laço**, não por multicast — conforme a
-> orientação de que não é necessário multicast para esta tarefa.
 
 O projeto usa somente a biblioteca padrão do Python e roda em Linux/Unix e
 macOS.
