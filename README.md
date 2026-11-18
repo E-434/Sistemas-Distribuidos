@@ -32,8 +32,6 @@ Linux/Unix. Não há dependência de APIs específicas do Windows.
   `seq_id`.
 - `src/benchmark.py` e `src/Benchmark_file.py`: benchmarks usando o mesmo
   protocolo cliente-front-end.
-- `RELATORIO_EVOLUCAO_ARQUITETURAL.md`: mapeamento detalhado da refatoração da
-  Parte 1 para esta etapa da Parte 2.
 
 ## Execução
 
