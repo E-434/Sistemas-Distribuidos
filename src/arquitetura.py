@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import ipaddress
 from enum import Enum
 from time import monotonic
 
@@ -27,10 +26,13 @@ class ReplicaDescriptor:
 
 @dataclass(frozen=True)
 class ClusterConfig:
-    """Parâmetros de rede e de observação (não de quórum de processamento)."""
+    """Parâmetros de rede e de quórum de processamento da replicação ativa.
 
-    multicast_group: str = "239.10.10.10"
-    multicast_port: int = 5001
+    A disseminação é feita por UNICAST em laço sobre as réplicas registradas
+    (não há multicast): o front-end envia cada operação ordenada diretamente a
+    cada Replica Manager ativo.
+    """
+
     heartbeat_interval_seconds: float = 1.0
     heartbeat_timeout_seconds: float = 4.0
     receipt_ack_timeout_seconds: float = 0.5
@@ -39,11 +41,6 @@ class ClusterConfig:
     replicas: tuple[ReplicaDescriptor, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
-        group = ipaddress.ip_address(self.multicast_group)
-        if group.version != 4 or not group.is_multicast:
-            raise ValueError("multicast_group deve ser um endereço IPv4 multicast")
-        if not 1 <= self.multicast_port <= 65535:
-            raise ValueError("multicast_port deve estar entre 1 e 65535")
         if not 0 < self.heartbeat_interval_seconds < self.heartbeat_timeout_seconds:
             raise ValueError("heartbeat interval deve ser positivo e menor que o timeout")
         if self.receipt_ack_timeout_seconds <= 0:
@@ -59,6 +56,25 @@ class ClusterConfig:
         if expected == 0:
             return 0
         return self.receipt_ack_quorum or (expected // 2 + 1)
+
+    def quorum_target(self, active_replicas: int) -> int:
+        """Quantos ACKs de APLICAÇÃO de réplicas são exigidos para confirmar.
+
+        O quórum é a maioria dos membros do grupo contando o próprio front-end
+        (que já aplicou a operação antes de disseminá-la). Assim, exigimos
+        `maioria - 1` ACKs de réplicas. Sem réplicas ativas o alvo é 0 e o
+        front-end responde imediatamente, mantendo o serviço utilizável.
+
+        `--receipt-ack-quorum`, se informado, sobrescreve a meta (limitada ao
+        número de réplicas ativas, para permanecer alcançável).
+        """
+        if active_replicas <= 0:
+            return 0
+        if self.receipt_ack_quorum:
+            return min(self.receipt_ack_quorum, active_replicas)
+        total_members = active_replicas + 1  # inclui o front-end
+        majority = total_members // 2 + 1
+        return max(0, majority - 1)
 
 
 @dataclass
@@ -82,6 +98,28 @@ class ReceiptAckTracker:
     @property
     def target_met(self) -> bool:
         return self.target > 0 and len(self.received_nodes) >= self.target
+
+
+@dataclass
+class QuorumTracker:
+    """Operação disseminada aguardando quórum de APLICAÇÃO das réplicas.
+
+    O front-end já aplicou a operação `seq_id` e calculou a resposta final ao
+    cliente (`response`). Ele só a envia quando `target` réplicas confirmarem
+    que aplicaram até pelo menos `seq_id` (ou quando o prazo expira, para
+    preservar a disponibilidade). `expected_num_reqs`/`expected_total_sum` são
+    o estado correto esperado, usados para detectar divergência entre réplicas.
+    """
+
+    seq_id: int
+    expected_num_reqs: int
+    expected_total_sum: int
+    target: int
+    deadline: float
+    client_addr: tuple[str, int]
+    response: bytes
+    replied: bool = False
+    finalized: bool = False
 
 
 @dataclass

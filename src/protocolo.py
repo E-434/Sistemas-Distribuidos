@@ -15,14 +15,17 @@ TYPE_FRONTEND_INFO = "FRONTEND_INFO"
 TYPE_SUM_REQUEST = "SUM_REQUEST"
 TYPE_SUM_RESULT = "SUM_RESULT"
 
-# O registro RM↔FE é funcional. Os demais tipos são reservados para o canal de
-# dados e controle futuro: ordenação replicada, ACKs, heartbeat e eleição.
+# Canal intra-cluster (FE <-> Replica Managers).
 TYPE_ORDERED_REQUEST = "ORDERED_REQUEST"
 TYPE_REPLICA_ACK = "REPLICA_ACK"
 TYPE_REPLICA_REGISTER = "REPLICA_REGISTER"
 TYPE_REPLICA_REGISTERED = "REPLICA_REGISTERED"
 TYPE_REPLICA_HEARTBEAT = "REPLICA_HEARTBEAT"
 TYPE_REPLICA_RECEIPT_ACK = "REPLICA_RECEIPT_ACK"
+# Replicação ativa: a réplica confirma a APLICAÇÃO da operação (não só o
+# recebimento) e pede retransmissão de seq_ids perdidos via NACK.
+TYPE_REPLICA_APPLIED_ACK = "REPLICA_APPLIED_ACK"
+TYPE_REPLICA_NACK = "REPLICA_NACK"
 TYPE_HEARTBEAT = "HEARTBEAT"
 TYPE_ELECTION = "ELECTION"
 
@@ -31,6 +34,7 @@ STATUS_DUPLICATE = "DUPLICATE"
 STATUS_OUT_OF_ORDER = "OUT_OF_ORDER"
 STATUS_RECEIVED = "RECEIVED"
 STATUS_DUPLICATE_RECEIPT = "DUPLICATE_RECEIPT"
+STATUS_APPLIED = "APPLIED"
 
 
 def encode_message(message: dict[str, Any]) -> bytes:
@@ -179,5 +183,46 @@ def make_replica_receipt_ack(
             "frontend_id": frontend_id,
             "seq_id": seq_id,
             "status": status,
+        }
+    )
+
+
+def make_replica_applied_ack(
+    node_id: str,
+    frontend_id: str,
+    last_applied_seq_id: int,
+    num_reqs: int,
+    total_sum: int,
+) -> bytes:
+    """ACK de APLICAÇÃO: a réplica confirma até onde seu estado está aplicado.
+
+    `last_applied_seq_id` é o progresso contíguo da réplica (todas as operações
+    de 1 a esse valor já foram somadas). `num_reqs`/`total_sum` são o estado
+    replicado resultante, usados pelo front-end para detectar divergência.
+    """
+    return encode_message(
+        {
+            "type": TYPE_REPLICA_APPLIED_ACK,
+            "node_id": node_id,
+            "frontend_id": frontend_id,
+            "last_applied_seq_id": last_applied_seq_id,
+            "num_reqs": num_reqs,
+            "total_sum": total_sum,
+        }
+    )
+
+
+def make_replica_nack(
+    node_id: str,
+    frontend_id: str,
+    missing_seq_ids: list[int],
+) -> bytes:
+    """Pedido de retransmissão dos seq_ids que a réplica não recebeu."""
+    return encode_message(
+        {
+            "type": TYPE_REPLICA_NACK,
+            "node_id": node_id,
+            "frontend_id": frontend_id,
+            "missing": missing_seq_ids,
         }
     )

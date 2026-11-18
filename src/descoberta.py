@@ -13,7 +13,11 @@ from protocolo import (
 )
 
 BUFFER_SIZE: Final[int] = 4096
+# Endereços de descoberta. Além do broadcast (rede real), inclui a loopback
+# por unicast direto: em um único host (ex.: macOS, onde o broadcast não é
+# entregue na loopback) é assim que as réplicas e o cliente acham o FE local.
 BROADCAST_ADDRESSES: Final[tuple[str, ...]] = (
+    "127.0.0.1",
     "255.255.255.255",
     "127.255.255.255",
 )
@@ -43,6 +47,11 @@ def discover_frontend(
             except ConnectionResetError:
                 continue
             except socket.timeout:
+                break
+            except OSError:
+                # macOS pode reportar de forma assíncrona um erro do envio
+                # anterior de broadcast (EADDRNOTAVAIL) na próxima operação do
+                # socket. Trata como "sem resposta nesta tentativa".
                 break
 
             message = decode_message(data)

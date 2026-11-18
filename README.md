@@ -1,145 +1,151 @@
-# Serviço distribuído de soma sobre UDP
+# Serviço distribuído de soma sobre UDP com replicação ativa
 
-Implementação em Python 3.10+ de um serviço distribuído de soma sobre UDP.
-Todos os nós são iniciados pelo mesmo programa: cada servidor procura um
-front-end ativo; se encontrar, inicia como Replica Manager, e se não encontrar
-um, usa uma eleição dummy que promove o próprio nó a front-end. O FE atribui
-um `seq_id` global, calcula o total local e dissemina cada operação por
-multicast. Os RMs validam e confirmam apenas o recebimento. **A promoção atual
-é apenas um placeholder: não há eleição coordenada, aplicação da soma nos
-RMs, quórum de processamento, failover ou recuperação de estado.**
+Implementação em Python 3.10+ de um serviço distribuído de soma sobre UDP com
+**replicação ativa** (state-machine replication). Todos os nós são iniciados
+pelo mesmo programa: cada servidor procura um front-end ativo; se encontrar,
+inicia como Replica Manager (RM); se não encontrar, usa uma eleição dummy que
+promove o próprio nó a front-end (FE).
 
-O projeto usa somente a biblioteca padrão do Python e pode ser executado em
-Linux/Unix. Não há dependência de APIs específicas do Windows.
+O FE atribui um `seq_id` global a cada operação, aplica a soma ao seu próprio
+estado e **dissemina a operação por unicast, em laço, para cada RM ativo**. Cada
+RM mantém a sua própria cópia da máquina de estados e **aplica** cada operação
+na ordem do `seq_id`; como todos aplicam a mesma sequência de operações na mesma
+ordem, convergem para o mesmo estado. O FE só **confirma a operação ao cliente
+depois que um quórum de réplicas confirma a aplicação**. Entregas perdidas pelo
+UDP são recuperadas por hold-back + NACK/retransmissão.
+
+> A disseminação é por **unicast em laço**, não por multicast — conforme a
+> orientação de que não é necessário multicast para esta tarefa.
+
+O projeto usa somente a biblioteca padrão do Python e roda em Linux/Unix e
+macOS.
 
 ## Arquivos
 
 - `src/cliente.py`: gera um `client_id`, descobre o front-end e envia operações
   stop-and-wait com `request_id`.
-- `src/servidor.py`: servidor UDP unificado. Descobre o FE ativo e executa
-  como RM, ou inicia como FE pelo placeholder de eleição; contém ambos os
-  papéis e seus canais de comunicação.
-- `src/replica_manager.py`: entrypoint legado desativado; a implementação do
-  Replica Manager foi incorporada a `src/servidor.py`.
-- `src/descoberta.py`: descoberta do front-end por broadcast e resposta unicast.
-- `src/processamento.py`: sequenciamento global, idempotência por cliente e
-  acumulador temporário da configuração sem réplicas.
-- `src/protocolo.py`: mensagens versionadas para os canais externo e
-  intra-cluster, incluindo operações multicast, ACKs de recebimento e heartbeat.
-- `src/arquitetura.py`: identidades, descritores e estado de membership da
-  topologia do cluster.
-- `src/interface.py`: formatação dos logs com identificação do front-end e
-  `seq_id`.
-- `src/benchmark.py` e `src/Benchmark_file.py`: benchmarks usando o mesmo
-  protocolo cliente-front-end.
+- `src/servidor.py`: servidor UDP unificado. Contém o **FrontendServer**
+  (sequenciador + disseminador + coletor de quórum) e o **ReplicaManagerNode**
+  (réplica ativa que aplica a sequência), além da descoberta/eleição.
+- `src/replica_manager.py`: entrypoint legado desativado; a implementação do RM
+  foi incorporada a `src/servidor.py`.
+- `src/descoberta.py`: descoberta do front-end por broadcast + loopback e
+  resposta unicast.
+- `src/processamento.py`: sequenciamento global e idempotência por cliente no FE
+  (`RequestProcessor`) e a máquina de estados replicada (`ReplicatedSumState`).
+- `src/protocolo.py`: mensagens versionadas dos canais externo e intra-cluster.
+- `src/arquitetura.py`: identidades, descritores, membership, quórum e trackers.
+- `src/interface.py`: formatação dos logs.
+- `src/benchmark.py` e `src/Benchmark_file.py`: benchmarks cliente↔FE.
+- `tests/test_replicacao_ativa.py`: teste de integração da replicação ativa
+  (convergência, quórum e recuperação por NACK).
 
 ## Execução
 
-Inicie todos os servidores usando o mesmo comando e a porta externa do serviço.
-O primeiro nó sem FE detectável se promove a FE; os próximos se registram como
-RMs:
+Inicie todos os servidores com o mesmo comando e a mesma porta externa. O
+primeiro nó sem FE detectável se promove a FE; os próximos se registram como RMs:
 
 ```bash
-python3 src/servidor.py 4000
-python3 src/servidor.py 4000
+python3 src/servidor.py 4000      # vira FE
+python3 src/servidor.py 4000      # vira RM (descobre o FE)
+python3 src/servidor.py 4000      # vira RM
 ```
 
-O processo que encontrar o FE ativo junta-se ao multicast, registra-se e envia
-heartbeats. Use o mesmo valor de porta externa em todos os nós do cluster;
-apenas o FE ocupa essa porta para atender descoberta e clientes. A porta de
-multicast permanece configurável e, por padrão, é `5001`.
-
-Em outro terminal, inicie o cliente:
+Em outro terminal, inicie o cliente e digite inteiros positivos, um por linha
+(Ctrl+D encerra após processar a fila; Ctrl+C interrompe):
 
 ```bash
 python3 src/cliente.py 4000
 ```
 
-Digite inteiros positivos, um por linha. Ctrl+D encerra a entrada depois de
-processar a fila; Ctrl+C interrompe o cliente. Para encerrar o front-end, use
-Ctrl+C no terminal correspondente. O timeout do cliente pode ser configurado
-em segundos:
+Parâmetros opcionais de cluster (iguais em todos os nós):
 
 ```bash
-python3 src/cliente.py 4000 0.05
+python3 src/servidor.py 4000 \
+  --heartbeat-interval 1 --heartbeat-timeout 4 \
+  --receipt-ack-timeout 0.5 \
+  --expected-replicas 2 --receipt-ack-quorum 0
 ```
+
+- `--receipt-ack-timeout`: prazo para o FE esperar o quórum antes de responder
+  mesmo assim (disponibilidade).
+- `--receipt-ack-quorum`: nº de ACKs de aplicação exigidos; `0` deriva a maioria
+  dos membros do grupo (contando o FE).
+- `--expected-replicas`: usado apenas na métrica de membership.
 
 ## Protocolo e estado
 
-Os datagramas são objetos JSON UTF-8 com `version: 2`.
+Datagramas são objetos JSON UTF-8 com `version: 2`.
 
-1. `DISCOVER_FRONTEND`: cliente anuncia seu `client_id` por broadcast.
-2. `FRONTEND_INFO`: o front-end responde unicast com identidade e endereço.
-3. `SUM_REQUEST`: inclui `client_id`, `request_id` e `value`.
-4. `SUM_RESULT`: inclui o `seq_id` global, estado acumulado e status.
-5. `ORDERED_REQUEST`: o FE envia por multicast o `seq_id` e os dados da
-   operação aos RMs.
-6. `REPLICA_RECEIPT_ACK`: RM confirma recebimento e validação estrutural; não
-   confirma execução da soma.
-7. `REPLICA_HEARTBEAT`: RM informa atividade ao FE para atualizar membership.
+**Canal cliente↔FE**
 
-O front-end só incrementa `seq_id` ao aceitar uma nova requisição na ordem
-esperada daquele cliente. Reenvios de `request_id` já processados são
-identificados como duplicatas e não alteram a soma. O `seq_id` é monotônico
-durante a vida do FE e é incluído no datagrama multicast.
+1. `DISCOVER_FRONTEND` / `FRONTEND_INFO`: descoberta do FE.
+2. `SUM_REQUEST` (`client_id`, `request_id`, `value`).
+3. `SUM_RESULT` (`seq_id`, `num_reqs`, `total_sum`, `status`): enviado **após o
+   quórum** (ou imediatamente se não houver réplicas).
 
-O processo RM registra `node_id` e porta de escuta com `REPLICA_REGISTER`;
-o front-end confirma com `REPLICA_REGISTERED` e mantém membership em memória.
-`REPLICA_HEARTBEAT` atualiza a última atividade; nós sem heartbeat dentro do
-timeout configurado ficam `suspect` e deixam de ser alvos do multicast.
+**Canal FE↔RM (intra-cluster, unicast)**
 
-Cada `ORDERED_REQUEST` inclui `seq_id`, `client_id`, `request_id` e `value`.
-O RM valida os campos e reporta lacunas, duplicatas ou sequências fora de
-ordem para observabilidade, mas não aplica a operação. `REPLICA_RECEIPT_ACK`
-confirma somente que o datagrama válido foi recebido. O FE conta ACKs por
-sequência e registra se a meta de recebimento foi atingida; essa métrica não
-condiciona nem valida o resultado enviado ao cliente.
+4. `REPLICA_REGISTER` / `REPLICA_REGISTERED`: o RM registra a sua porta efêmera
+   de escuta; o FE confirma e passa a enviar operações para esse endereço.
+5. `ORDERED_REQUEST` (`seq_id`, `client_id`, `request_id`, `value`): operação
+   ordenada enviada a cada RM ativo.
+6. `REPLICA_APPLIED_ACK` (`last_applied_seq_id`, `num_reqs`, `total_sum`): o RM
+   confirma **até onde o seu estado está aplicado** e reporta o estado (usado
+   para o quórum e para detectar divergência).
+7. `REPLICA_NACK` (`missing`): o RM pede retransmissão dos `seq_id` que faltam.
+8. `REPLICA_HEARTBEAT`: o RM informa atividade ao FE.
+
+**Ordenação, idempotência e quórum**
+
+- O FE só incrementa `seq_id` ao aceitar uma requisição na ordem esperada do
+  cliente; reenvios de `request_id` já processados são tratados como duplicatas
+  e respondidos imediatamente, sem alterar a soma.
+- Cada RM aplica estritamente `last_applied_seq_id + 1`. `ORDERED_REQUEST` fora
+  de ordem vai para o **hold-back buffer**; lacunas disparam **NACK**, e o FE
+  retransmite a partir do seu **log de operações**. Reentregas são ignoradas de
+  forma idempotente.
+- O FE confirma a operação ao cliente quando `quórum` réplicas têm
+  `last_applied_seq_id >= seq_id`. Se o prazo expira sem quórum, o FE responde
+  assim mesmo (o resultado é correto pela ordem total) e registra `quorum_timeout`.
 
 ## Estado da implementação
 
-A versão atual fornece os dois canais UDP e nós RM recebendo operações.
-O estado da soma continua local ao FE e é respondido sem esperar ACKs; não há
-quorum de processamento, recuperação de estado, failover ou eleição. O
-heartbeat apenas classifica membership e não promove líderes. A eleição dummy
-ocorre somente na inicialização: se a descoberta não encontrar um FE, o próprio
-processo se promove. Ela não coordena candidatos, então inícios simultâneos
-podem criar mais de um FE.
+Implementado: sequenciamento global, disseminação unicast, **aplicação da soma
+em todos os RMs**, **quórum de processamento**, recuperação de operações perdidas
+por hold-back/NACK e detecção de divergência. O serviço permanece utilizável sem
+réplicas (o FE responde imediatamente).
 
-### Parâmetros de cluster
+**Fora do escopo desta etapa** (próximos passos): eleição coordenada real (a
+atual é dummy, só na inicialização), failover do FE e transferência de estado
+por snapshot para um RM que entra depois que o log de operações já foi truncado.
 
-FE e RMs precisam usar o mesmo endereço e porta multicast:
+## Teste de integração
+
+O teste sobe um cluster real em subprocessos (loopback) e comprova (1) a
+convergência de FE + réplicas, (2) o quórum, e (3) a recuperação de uma réplica
+**atrasada** via NACK:
 
 ```bash
-python3 src/servidor.py 4000 \
-  --multicast-group 239.10.10.10 --multicast-port 5001 \
-  --heartbeat-interval 1 --heartbeat-timeout 4 \
-  --receipt-ack-timeout 0.5 --expected-replicas 2
-python3 src/servidor.py 4000 \
-  --multicast-group 239.10.10.10 --multicast-port 5001 \
-  --heartbeat-interval 1
+python3 tests/test_replicacao_ativa.py          # 2 lotes de 1500 ops = 3000
+python3 tests/test_replicacao_ativa.py 50        # execução rápida
 ```
 
-As opções de cluster devem ser iguais em todos os servidores. Para testar em
-máquinas distintas, use a mesma porta externa e verifique se broadcast e
-multicast UDP estão permitidos na rede.
+Ao final, FE, `replica-1`, `replica-2` e `replica-3-atrasada` devem apresentar
+`num_reqs` e `total_sum` idênticos.
 
-`--receipt-ack-quorum` configura uma meta de ACKs de **recebimento**. Se não
-informada (ou 0), a meta é maioria do número esperado; `--expected-replicas 0`
-usa o membership ativo no momento do envio. É apenas instrumentação e não
-representa um quórum de resultados computados.
+> Nota (macOS): o broadcast não é entregue na interface de loopback e um erro
+> assíncrono de broadcast pode aparecer na operação seguinte do socket. A
+> descoberta inclui a loopback (`127.0.0.1`) por unicast e tolera esse erro, de
+> modo que o cluster roda em um único host macOS.
 
 ## Benchmark
-
-O benchmark padrão envia 1 milhão de requisições de valor 1:
 
 ```bash
 python3 src/servidor.py 4000
 python3 src/benchmark.py 4000
 ```
 
-O resultado esperado em um front-end recém-iniciado é `num_reqs 1000000` e
-`total_sum 1000000`. O benchmark de arquivo aceita um caminho de números:
-
-```bash
-python3 src/Benchmark_file.py 4000 src/RAND_NUM_1.txt
-```
+Com um FE sem réplicas, o resultado esperado é `num_reqs 1000000` e
+`total_sum 1000000`. Com réplicas, cada operação espera o quórum, então a taxa é
+menor.
