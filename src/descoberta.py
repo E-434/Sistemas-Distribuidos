@@ -40,6 +40,8 @@ def discover_frontend(
         while True:
             try:
                 data, sender = sock.recvfrom(BUFFER_SIZE)
+            except ConnectionResetError:
+                continue
             except socket.timeout:
                 break
 

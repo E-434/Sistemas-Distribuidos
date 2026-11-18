@@ -6,31 +6,41 @@ from __future__ import annotations
 import socket
 import sys
 import argparse
+import struct
 import time
+import uuid
 from collections import deque
 from typing import Final, Any
 
 from arquitetura import ClusterConfig, MembershipState, NodeRole
 from arquitetura import ReceiptAckTracker, ReplicaDescriptor
-from descoberta import respond_to_discovery
+from descoberta import discover_frontend, respond_to_discovery
 from interface import server_processing_event, server_started
 from processamento import RequestProcessor
 from protocolo import (
     TYPE_DISCOVER_FRONTEND,
+    TYPE_ORDERED_REQUEST,
     TYPE_REPLICA_HEARTBEAT,
     TYPE_REPLICA_RECEIPT_ACK,
     TYPE_REPLICA_REGISTER,
+    TYPE_REPLICA_REGISTERED,
     TYPE_SUM_REQUEST,
     STATUS_PROCESSED,
     STATUS_RECEIVED,
     decode_message,
     make_ordered_request,
+    make_replica_heartbeat,
+    make_replica_receipt_ack,
     make_replica_registered,
+    make_replica_register,
 )
 
 BUFFER_SIZE: Final[int] = 4096
 MEMBERSHIP_SWEEP_INTERVAL_SECONDS: Final[float] = 0.2
 MAX_COMPLETED_ACK_TRACKERS: Final[int] = 1024
+REGISTRATION_TIMEOUT_SECONDS: Final[float] = 1.0
+REGISTRATION_ATTEMPTS: Final[int] = 5
+UINT64_MAX: Final[int] = (1 << 64) - 1
 
 
 class FrontendServer:
@@ -328,6 +338,9 @@ class FrontendServer:
             while True:
                 try:
                     data, sender = self.sock.recvfrom(BUFFER_SIZE)
+                except ConnectionResetError:
+                    self.maintain_membership_and_ack_trackers()
+                    continue
                 except socket.timeout:
                     self.maintain_membership_and_ack_trackers()
                     continue
@@ -352,9 +365,260 @@ class FrontendServer:
             self.multicast_sock.close()
 
 
+class ReplicaManagerNode:
+    """Componente RM executado pelo mesmo servidor quando outro FE foi encontrado."""
+
+    def __init__(
+        self,
+        node_id: str,
+        listen_port: int,
+        frontend_addr: tuple[str, int],
+        frontend_id: str,
+        cluster_config: ClusterConfig,
+    ) -> None:
+        self.node_id = node_id
+        self.listen_port = listen_port
+        self.frontend_addr = frontend_addr
+        self.frontend_id = frontend_id
+        self.cluster_config = cluster_config
+        self.membership = MembershipState(
+            node_id=node_id,
+            role=NodeRole.REPLICA_MANAGER,
+            leader_id=frontend_id,
+        )
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(("", listen_port))
+            group = socket.inet_aton(cluster_config.multicast_group)
+            membership_request = struct.pack(
+                "4s4s",
+                group,
+                socket.inet_aton("0.0.0.0"),
+            )
+            self.sock.setsockopt(
+                socket.IPPROTO_IP,
+                socket.IP_ADD_MEMBERSHIP,
+                membership_request,
+            )
+            self.sock.settimeout(0.2)
+        except OSError:
+            self.sock.close()
+            raise
+
+    def register(self) -> None:
+        packet = make_replica_register(self.node_id, self.listen_port)
+        self.sock.settimeout(REGISTRATION_TIMEOUT_SECONDS)
+        for _ in range(REGISTRATION_ATTEMPTS):
+            self.sock.sendto(packet, self.frontend_addr)
+            while True:
+                try:
+                    data, sender = self.sock.recvfrom(BUFFER_SIZE)
+                except ConnectionResetError:
+                    continue
+                except socket.timeout:
+                    break
+
+                if sender != self.frontend_addr:
+                    continue
+                message = decode_message(data)
+                if (
+                    message is None
+                    or message.get("type") != TYPE_REPLICA_REGISTERED
+                    or message.get("node_id") != self.node_id
+                ):
+                    continue
+                if message.get("accepted") is not True:
+                    raise RuntimeError("o front-end rejeitou o registro do Replica Manager")
+                return
+
+        raise RuntimeError(
+            f"não foi possível registrar {self.node_id} no front-end "
+            f"{self.frontend_addr[0]}:{self.frontend_addr[1]}"
+        )
+
+    def process_ordered_request(self, message: dict[str, Any]) -> None:
+        seq_id = message.get("seq_id")
+        client_id = message.get("client_id")
+        request_id = message.get("request_id")
+        value = message.get("value")
+        if message.get("frontend_id") != self.frontend_id:
+            print(
+                f"ordered_request_rejected node_id {self.node_id} "
+                "reason frontend_id_mismatch",
+                flush=True,
+            )
+            return
+        if (
+            not isinstance(seq_id, int)
+            or isinstance(seq_id, bool)
+            or not 1 <= seq_id <= UINT64_MAX
+            or not isinstance(client_id, str)
+            or not client_id
+            or len(client_id) > 128
+            or not isinstance(request_id, int)
+            or isinstance(request_id, bool)
+            or not 1 <= request_id <= UINT64_MAX
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= UINT64_MAX
+        ):
+            print(
+                f"ordered_request_rejected node_id {self.node_id} "
+                "reason invalid_fields",
+                flush=True,
+            )
+            return
+
+        previous_seq_id = self.membership.last_received_seq_id
+        if seq_id == previous_seq_id:
+            sequence_status = "duplicate"
+        elif seq_id < previous_seq_id:
+            sequence_status = "out_of_order"
+        elif previous_seq_id and seq_id > previous_seq_id + 1:
+            sequence_status = f"gap_after_{previous_seq_id}"
+            self.membership.last_received_seq_id = seq_id
+        else:
+            sequence_status = "in_order"
+            self.membership.last_received_seq_id = seq_id
+
+        print(
+            f"ordered_request_received node_id {self.node_id} "
+            f"seq_id {seq_id} client_id {client_id} request_id {request_id} "
+            f"value {value} sequence_status {sequence_status} "
+            "operation_applied false",
+            flush=True,
+        )
+        self.sock.sendto(
+            make_replica_receipt_ack(
+                self.node_id,
+                self.frontend_id,
+                seq_id,
+                STATUS_RECEIVED,
+            ),
+            self.frontend_addr,
+        )
+
+    def send_heartbeat(self) -> None:
+        self.sock.sendto(
+            make_replica_heartbeat(self.node_id, self.frontend_id),
+            self.frontend_addr,
+        )
+
+    def run(self) -> None:
+        try:
+            self.register()
+            print(
+                f"role replica_manager node_id {self.node_id} "
+                f"frontend_id {self.frontend_id} "
+                f"listen_port {self.listen_port} status registered "
+                "data_plane receipt_only",
+                flush=True,
+            )
+            self.sock.settimeout(
+                min(0.2, self.cluster_config.heartbeat_interval_seconds)
+            )
+            next_heartbeat = time.monotonic()
+            while True:
+                now = time.monotonic()
+                if now >= next_heartbeat:
+                    self.send_heartbeat()
+                    next_heartbeat = now + self.cluster_config.heartbeat_interval_seconds
+
+                try:
+                    data, _sender = self.sock.recvfrom(BUFFER_SIZE)
+                except ConnectionResetError:
+                    continue
+                except socket.timeout:
+                    continue
+                message = decode_message(data)
+                if message is None:
+                    print(
+                        f"datagram_rejected node_id {self.node_id} "
+                        "reason malformed_or_wrong_version",
+                        flush=True,
+                    )
+                elif message.get("type") == TYPE_ORDERED_REQUEST:
+                    self.process_ordered_request(message)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.sock.close()
+
+
+class DistributedServer:
+    """Descobre o FE ativo e inicia como RM ou se promove via eleição dummy."""
+
+    def __init__(self, port: int, cluster_config: ClusterConfig) -> None:
+        self.port = port
+        self.cluster_config = cluster_config
+        self.node_id = f"server-{uuid.uuid4().hex[:12]}"
+
+    def elect_frontend_dummy(self) -> bool:
+        """Placeholder: sem coordenador ou votação, o próprio nó vira FE."""
+        print(
+            f"election_started node_id {self.node_id} algorithm dummy",
+            flush=True,
+        )
+        print(
+            f"election_result node_id {self.node_id} "
+            "role frontend decision self_promotion",
+            flush=True,
+        )
+        return True
+
+    def run(self) -> None:
+        discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            try:
+                frontend_addr, frontend_id = discover_frontend(
+                    discovery_sock,
+                    self.port,
+                    self.node_id,
+                )
+            except RuntimeError:
+                frontend_addr = None
+                frontend_id = ""
+        finally:
+            discovery_sock.close()
+
+        if frontend_addr is not None:
+            print(
+                f"frontend_discovered frontend_id {frontend_id} "
+                f"addr {frontend_addr[0]}:{frontend_addr[1]}",
+                flush=True,
+            )
+            ReplicaManagerNode(
+                self.node_id,
+                self.cluster_config.multicast_port,
+                frontend_addr,
+                frontend_id,
+                self.cluster_config,
+            ).run()
+            return
+
+        if not self.elect_frontend_dummy():
+            raise RuntimeError("a eleição dummy não selecionou um front-end")
+        frontend_id = f"frontend-{self.port}-{self.node_id}"
+        print(
+            f"frontend_starting frontend_id {frontend_id} port {self.port}",
+            flush=True,
+        )
+        FrontendServer(
+            self.port,
+            frontend_id=frontend_id,
+            cluster_config=self.cluster_config,
+        ).run()
+
+
 def parse_args(argv: list[str]) -> tuple[int, ClusterConfig]:
     parser = argparse.ArgumentParser(
-        description="Front-end UDP com multicast e ACKs de recebimento (sem replicação)."
+        description=(
+            "Servidor UDP unificado: descobre o front-end ativo e inicia como "
+            "Replica Manager; se não encontrar um, usa a eleição dummy e inicia como FE."
+        )
     )
     parser.add_argument("port", type=int)
     parser.add_argument("--multicast-group", default="239.10.10.10")
@@ -396,7 +660,7 @@ def parse_args(argv: list[str]) -> tuple[int, ClusterConfig]:
 
 def main() -> None:
     port, cluster_config = parse_args(sys.argv)
-    FrontendServer(port, cluster_config=cluster_config).run()
+    DistributedServer(port, cluster_config).run()
 
 
 if __name__ == "__main__":

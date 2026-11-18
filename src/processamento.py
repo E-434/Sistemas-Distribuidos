@@ -184,6 +184,8 @@ def wait_for_ack(
     while not stop_event.is_set():
         try:
             data, sender = sock.recvfrom(BUFFER_SIZE)
+        except ConnectionResetError:
+            continue
         except socket.timeout:
             return None
         except OSError:
