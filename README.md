@@ -14,8 +14,8 @@ ordem, convergem para o mesmo estado. O FE só **confirma a operação ao client
 depois que um quórum de réplicas confirma a aplicação**. Entregas perdidas pelo
 UDP são recuperadas por hold-back + NACK/retransmissão.
 
-O projeto usa somente a biblioteca padrão do Python e roda em Linux/Unix e
-macOS.
+O projeto usa somente a biblioteca padrão do Python e pode ser executado em Linux/Unix e
+macOS. Não há dependência de APIs específicas do Windows.
 
 ## Arquivos
 
@@ -74,14 +74,14 @@ python3 src/servidor.py 4000 \
 
 Datagramas são objetos JSON UTF-8 com `version: 2`.
 
-**Canal cliente↔FE**
+**Canal Cliente<->FE**
 
 1. `DISCOVER_FRONTEND` / `FRONTEND_INFO`: descoberta do FE.
 2. `SUM_REQUEST` (`client_id`, `request_id`, `value`).
 3. `SUM_RESULT` (`seq_id`, `num_reqs`, `total_sum`, `status`): enviado **após o
    quórum** (ou imediatamente se não houver réplicas).
 
-**Canal FE↔RM (intra-cluster, unicast)**
+**Canal FE<->RM**
 
 4. `REPLICA_REGISTER` / `REPLICA_REGISTERED`: o RM registra a sua porta efêmera
    de escuta; o FE confirma e passa a enviar operações para esse endereço.
@@ -93,7 +93,7 @@ Datagramas são objetos JSON UTF-8 com `version: 2`.
 7. `REPLICA_NACK` (`missing`): o RM pede retransmissão dos `seq_id` que faltam.
 8. `REPLICA_HEARTBEAT`: o RM informa atividade ao FE.
 
-**Ordenação, idempotência e quórum**
+**Observações**
 
 - O FE só incrementa `seq_id` ao aceitar uma requisição na ordem esperada do
   cliente; reenvios de `request_id` já processados são tratados como duplicatas
@@ -132,9 +132,9 @@ Ao final, FE, `replica-1`, `replica-2` e `replica-3-atrasada` devem apresentar
 `num_reqs` e `total_sum` idênticos.
 
 > Nota (macOS): o broadcast não é entregue na interface de loopback e um erro
-> assíncrono de broadcast pode aparecer na operação seguinte do socket. A
+> pode aparecer na operação seguinte do socket. A
 > descoberta inclui a loopback (`127.0.0.1`) por unicast e tolera esse erro, de
-> modo que o cluster roda em um único host macOS.
+> modo que o cluster de teste rode em um host macOS.
 
 ## Benchmark
 
