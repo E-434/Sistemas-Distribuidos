@@ -47,12 +47,7 @@ class ProcessingEvent:
 
 
 class RequestProcessor:
-    """Sequenciador global para a fase inicial sem replicação ativa.
-
-    O estado local mantém o serviço utilizável enquanto os Replica Managers
-    não são conectados. `seq_id` é o contrato de ordenação que será disseminado
-    pelo front-end quando o transporte intra-cluster for implementado.
-    """
+    """Sequenciador global para o front-end."""
 
     def __init__(self) -> None:
         self.num_reqs = 0
@@ -161,36 +156,33 @@ class RequestProcessor:
 
 
 class ReplicatedSumState:
-    """Máquina de estados determinística replicada em cada Replica Manager.
-
-    É a mesma computação do front-end (acumular `value` e contar requisições),
-    mas dirigida exclusivamente pela ordem total do `seq_id`. Como todos os nós
-    aplicam a MESMA sequência de operações na MESMA ordem, convergem para o
-    mesmo estado (replicação ativa / state-machine replication).
-
-    O front-end já deduplica por cliente/`request_id` antes de atribuir o
-    `seq_id`, então a réplica só precisa garantir ordem contígua: aplica
-    exatamente `last_applied_seq_id + 1`. Reentregas (retransmissões) de um
-    `seq_id` já aplicado são ignoradas de forma idempotente.
-    """
+    """Máquina de estados determinística replicada em cada Replica Manager."""
 
     def __init__(self) -> None:
         self.num_reqs = 0
         self.total_sum = 0
         self.last_applied_seq_id = 0
+        self.clients: dict[str, ClientState] = {}
 
-    def apply(self, seq_id: int, value: int) -> bool:
-        """Aplica a operação se, e somente se, for a próxima da sequência.
-
-        Retorna True quando a soma foi efetivamente aplicada; False para
-        duplicatas (`seq_id` já aplicado) ou lacunas (`seq_id` futuro), que o
-        chamador deve tratar com o buffer de hold-back.
-        """
+    def apply(
+        self,
+        seq_id: int,
+        value: int,
+        client_id: str = "",
+        request_id: int = 0,
+    ) -> bool:
+        """Aplica a operação se, e somente se, for a próxima da sequência."""
         if seq_id != self.last_applied_seq_id + 1:
             return False
         self.num_reqs += 1
         self.total_sum += value
         self.last_applied_seq_id = seq_id
+        if client_id and request_id > 0:
+            client = self.clients.setdefault(client_id, ClientState())
+            client.last_request_id = request_id
+            client.last_seq_id = seq_id
+            client.last_num_reqs = self.num_reqs
+            client.last_total_sum = self.total_sum
         return True
 
 

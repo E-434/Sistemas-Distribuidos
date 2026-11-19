@@ -1,10 +1,17 @@
-"""Configuração de transporte, membership e métricas de ACKs de recebimento."""
+"""Configuração de transporte, membership, anel e métricas de ACKs de recebimento."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import ipaddress
 from time import monotonic
+
+
+def ip_priority_key(ip: str, port: int, node_id: str = "") -> tuple[int, int, int, str]:
+    """Chave de ordenação para eleição por maior IP (desempate por porta e node_id)."""
+    parsed = ipaddress.ip_address(ip)
+    return (parsed.version, int(parsed), int(port), node_id)
 
 
 class NodeRole(str, Enum):
@@ -19,9 +26,66 @@ class ReplicaDescriptor:
     node_id: str
     host: str
     port: int
+    ring_port: int = 0
     registered: bool = True
     last_seen: float = field(default_factory=monotonic)
     status: str = "active"
+
+
+@dataclass
+class RingNodeInfo:
+    """Participante do anel lógico de eleição."""
+
+    node_id: str
+    ip: str
+    port: int
+
+    @property
+    def priority(self) -> tuple[int, int, int, str]:
+        return ip_priority_key(self.ip, self.port, self.node_id)
+
+
+@dataclass
+class RingTopology:
+    """Mantém o anel lógico ordenado e o salto em caso de sucessor inativo."""
+
+    self_info: RingNodeInfo
+    members: list[RingNodeInfo] = field(default_factory=list)
+    election_active: bool = False
+    candidate: RingNodeInfo | None = None
+    origin_id: str | None = None
+    hop_offset: int = 1
+    pending_target: RingNodeInfo | None = None
+    ack_deadline: float = 0.0
+
+    def upsert_member(self, node_id: str, ip: str, port: int) -> None:
+        by_id = {m.node_id: m for m in self.members}
+        by_id[node_id] = RingNodeInfo(node_id=node_id, ip=ip, port=port)
+        by_id[self.self_info.node_id] = self.self_info
+        self.members = sorted(by_id.values(), key=lambda m: (m.node_id, m.ip, m.port))
+
+    def remove_member(self, node_id: str) -> None:
+        if node_id == self.self_info.node_id:
+            return
+        self.members = [m for m in self.members if m.node_id != node_id]
+
+    def next_hop(self, offset: int | None = None) -> RingNodeInfo:
+        if not self.members:
+            return self.self_info
+        idx = next(
+            (i for i, m in enumerate(self.members) if m.node_id == self.self_info.node_id),
+            0,
+        )
+        step = self.hop_offset if offset is None else offset
+        return self.members[(idx + step) % len(self.members)]
+
+    def skip_unresponsive_hop(self) -> RingNodeInfo | None:
+        if len(self.members) <= 1:
+            return self.self_info
+        if self.hop_offset < len(self.members) - 1:
+            self.hop_offset += 1
+            return self.next_hop()
+        return None
 
 
 @dataclass(frozen=True)
@@ -36,6 +100,7 @@ class ClusterConfig:
     heartbeat_interval_seconds: float = 1.0
     heartbeat_timeout_seconds: float = 4.0
     receipt_ack_timeout_seconds: float = 0.5
+    election_ack_timeout_seconds: float = 0.25
     expected_replicas: int = 0
     receipt_ack_quorum: int = 0
     replicas: tuple[ReplicaDescriptor, ...] = field(default_factory=tuple)
@@ -45,6 +110,8 @@ class ClusterConfig:
             raise ValueError("heartbeat interval deve ser positivo e menor que o timeout")
         if self.receipt_ack_timeout_seconds <= 0:
             raise ValueError("receipt ACK timeout deve ser positivo")
+        if self.election_ack_timeout_seconds <= 0:
+            raise ValueError("election ACK timeout deve ser positivo")
         if self.expected_replicas < 0 or self.receipt_ack_quorum < 0:
             raise ValueError("parâmetros de réplicas e ACK quorum não podem ser negativos")
         if self.expected_replicas and self.receipt_ack_quorum > self.expected_replicas:
@@ -132,12 +199,4 @@ class MembershipState:
     epoch: int = 0
     last_applied_seq_id: int = 0
     last_received_seq_id: int = 0
-
-@dataclass
-class RingState:
-    """Estado de anel de descoberta de front-end e réplicas."""
-
-    first_node: str
-    previous_node: str
-    next_node: str
-    leader_id: str | None = None
+    ring: RingTopology | None = None
