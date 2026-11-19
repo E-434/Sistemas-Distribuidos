@@ -132,3 +132,12 @@ class MembershipState:
     epoch: int = 0
     last_applied_seq_id: int = 0
     last_received_seq_id: int = 0
+
+@dataclass
+class RingState:
+    """Estado de anel de descoberta de front-end e réplicas."""
+
+    first_node: str
+    previous_node: str
+    next_node: str
+    leader_id: str | None = None

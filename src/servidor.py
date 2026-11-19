@@ -17,10 +17,13 @@ import sys
 import argparse
 import time
 import uuid
-from collections import deque
-from typing import Final, Any, cast
+import asyncio
 
-from arquitetura import ClusterConfig, MembershipState, NodeRole
+from collections import deque
+from typing import Final, Any, cast, Optional, Set
+from enum import Enum, auto
+
+from arquitetura import ClusterConfig, MembershipState, NodeRole, RingState
 from arquitetura import QuorumTracker, ReplicaDescriptor
 from descoberta import discover_frontend, respond_to_discovery
 from interface import server_processing_event, server_started
@@ -53,6 +56,9 @@ REGISTRATION_TIMEOUT_SECONDS: Final[float] = 1.0
 REGISTRATION_ATTEMPTS: Final[int] = 5
 UINT64_MAX: Final[int] = (1 << 64) - 1
 
+class Role(Enum):
+    FRONTEND = auto()
+    REPLICA_MANAGER = auto()
 
 class FrontendServer:
     """FE: sequenciador, disseminador unicast e coletor de quórum de aplicação."""
@@ -690,7 +696,8 @@ class DistributedServer:
             flush=True,
         )
         return True
-
+    
+    
     def run(self) -> None:
         discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -722,6 +729,7 @@ class DistributedServer:
             ).run()
             return
 
+    
         if not self.elect_frontend_dummy():
             raise RuntimeError("a eleição dummy não selecionou um front-end")
         frontend_id = f"frontend-{self.port}-{self.node_id}"
@@ -787,6 +795,29 @@ def main() -> None:
     port, cluster_config = parse_args(sys.argv)
     DistributedServer(port, cluster_config).run()
 
+class RingCreator:
+    """Cria um anel de descoberta de front-end e réplicas."""
+
+    def __init__(self, nodes: list[str]):
+        if len(nodes) < 2:
+            raise ValueError("é necessário pelo menos 2 nós para formar um anel")
+        self.nodes = sorted(nodes)
+
+    def create_ring(self) -> list[RingState]:
+        ring_states = []
+        num_nodes = len(self.nodes)
+        for i, node in enumerate(self.nodes):
+            first_node = self.nodes[0]
+            previous_node = self.nodes[i - 1] if i > 0 else self.nodes[-1]
+            next_node = self.nodes[(i + 1) % num_nodes]
+            ring_states.append(
+                RingState(
+                    first_node=first_node,
+                    previous_node=previous_node,
+                    next_node=next_node,
+                )
+            )
+        return ring_states
 
 if __name__ == "__main__":
     main()
