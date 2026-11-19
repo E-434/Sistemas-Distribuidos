@@ -57,8 +57,10 @@ MEMBERSHIP_SWEEP_INTERVAL_SECONDS: Final[float] = 0.2
 OP_LOG_MAX: Final[int] = 200_000
 NACK_MAX_SEQS: Final[int] = 256
 NACK_MIN_INTERVAL_SECONDS: Final[float] = 0.1
+NACK_UNSATISFIABLE_COOLDOWN_SECONDS: Final[float] = 5.0
 REGISTRATION_TIMEOUT_SECONDS: Final[float] = 1.0
 REGISTRATION_ATTEMPTS: Final[int] = 5
+STARTUP_DISCOVERY_ATTEMPTS: Final[int] = 2
 UINT64_MAX: Final[int] = (1 << 64) - 1
 
 
@@ -92,9 +94,12 @@ class FrontendServer:
             self.sock = existing_sock
         else:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            self.sock.bind(("", port))
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                self.sock.bind(("", port))
+            except OSError:
+                self.sock.close()
+                raise
         self.sock.settimeout(MEMBERSHIP_SWEEP_INTERVAL_SECONDS)
         self.port = self.sock.getsockname()[1]
         self.frontend_id = frontend_id or f"frontend-{self.port}"
@@ -107,7 +112,9 @@ class FrontendServer:
         if initial_state is not None:
             self.processor.num_reqs = initial_state.num_reqs
             self.processor.total_sum = initial_state.total_sum
-            self.processor.next_seq_id = initial_state.last_applied_seq_id + 1
+            self.processor.next_seq_id = (
+                max(initial_state.last_applied_seq_id, initial_state.num_reqs) + 1
+            )
             for cid, cstate in initial_state.clients.items():
                 self.processor.clients[cid] = ClientState(
                     last_request_id=cstate.last_request_id,
@@ -184,6 +191,29 @@ class FrontendServer:
         message: dict[str, Any],
         sender: tuple[str, int],
     ) -> None:
+        client_id = message.get("client_id")
+        request_id = message.get("request_id")
+        if (
+            isinstance(client_id, str)
+            and client_id
+            and isinstance(request_id, int)
+            and not isinstance(request_id, bool)
+            and request_id > 1
+            and client_id not in self.processor.clients
+            and self.processor.num_reqs > 0
+        ):
+            self.processor.clients[client_id] = ClientState(
+                last_request_id=request_id - 1,
+                last_seq_id=self.processor.next_seq_id - 1,
+                last_num_reqs=self.processor.num_reqs,
+                last_total_sum=self.processor.total_sum,
+            )
+            print(
+                f"failover_client_synced client_id {client_id} "
+                f"assumed_last_request_id {request_id - 1}",
+                flush=True,
+            )
+
         response, event = self.processor.process_request(message, sender)
         if event is not None:
             print(server_processing_event(event), flush=True)
@@ -591,6 +621,7 @@ class ReplicaManagerNode:
         self.state = initial_state or ReplicatedSumState()
         self.holdback: dict[int, tuple[int, str, int]] = {}
         self._last_nack = 0.0
+        self._unsatisfiable_until: dict[int, float] = {}
         self._last_fe_contact = time.monotonic()
         self._fe_failed_reported = False
         self._hop_seq = 0
@@ -682,6 +713,7 @@ class ReplicaManagerNode:
             if nxt not in self.holdback:
                 break
             value, client_id, request_id = self.holdback.pop(nxt)
+            self._unsatisfiable_until.pop(nxt, None)
             self.state.apply(nxt, value, client_id=client_id, request_id=request_id)
             progressed = True
             print(
@@ -693,7 +725,7 @@ class ReplicaManagerNode:
             self.send_applied_ack()
 
     def request_missing(self, force: bool = False) -> None:
-        if not self.holdback:
+        if self.ring.election_active or not self.holdback:
             return
         head = self.state.last_applied_seq_id + 1
         if head in self.holdback:
@@ -702,10 +734,16 @@ class ReplicaManagerNode:
         if not force and now - self._last_nack < NACK_MIN_INTERVAL_SECONDS:
             return
         smallest_buffered = min(self.holdback)
-        missing = list(range(head, smallest_buffered))[:NACK_MAX_SEQS]
+        missing = [
+            seq
+            for seq in range(head, smallest_buffered)
+            if now >= self._unsatisfiable_until.get(seq, 0.0)
+        ][:NACK_MAX_SEQS]
         if not missing:
             return
         self._last_nack = now
+        for seq in missing:
+            self._unsatisfiable_until[seq] = now + NACK_UNSATISFIABLE_COOLDOWN_SECONDS
         self.sock.sendto(
             make_replica_nack(self.node_id, self.frontend_id, missing),
             self.frontend_addr,
@@ -739,10 +777,12 @@ class ReplicaManagerNode:
         value = cast(int, value)
 
         if seq_id <= self.state.last_applied_seq_id:
+            self._unsatisfiable_until.pop(seq_id, None)
             self.send_applied_ack()
             return
 
         self.holdback[seq_id] = (value, client_id, request_id)
+        self._unsatisfiable_until.pop(seq_id, None)
         self.drain_apply()
         self.request_missing()
 
@@ -793,9 +833,12 @@ class ReplicaManagerNode:
         ]
         self.sock.close()
         fe_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        fe_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        fe_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        fe_sock.bind(("", leader_port))
+        try:
+            fe_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            fe_sock.bind(("", leader_port))
+        except OSError:
+            fe_sock.close()
+            raise
         self._promoted_frontend = FrontendServer(
             port=leader_port,
             frontend_id=leader_id,
@@ -1062,22 +1105,44 @@ class DistributedServer:
         )
         return True
 
-    def run(self) -> None:
-        discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
+    def _try_discover_frontend(self) -> tuple[tuple[str, int] | None, str]:
+        for attempt in range(1, STARTUP_DISCOVERY_ATTEMPTS + 1):
+            t0 = time.monotonic()
+            print(
+                f"discovery_attempt node_id {self.node_id} "
+                f"attempt {attempt}/{STARTUP_DISCOVERY_ATTEMPTS} port {self.port}",
+                flush=True,
+            )
+            discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                frontend_addr, frontend_id = discover_frontend(
+                addr, fid = discover_frontend(
                     discovery_sock,
                     self.port,
                     self.node_id,
                 )
+                elapsed = time.monotonic() - t0
+                print(
+                    f"discovery_result node_id {self.node_id} attempt {attempt} "
+                    f"status found frontend_id {fid} addr {addr[0]}:{addr[1]} "
+                    f"elapsed {elapsed:.3f}s",
+                    flush=True,
+                )
+                return addr, fid
             except RuntimeError:
-                frontend_addr = None
-                frontend_id = ""
-        finally:
-            discovery_sock.close()
+                elapsed = time.monotonic() - t0
+                print(
+                    f"discovery_result node_id {self.node_id} attempt {attempt} "
+                    f"status not_found elapsed {elapsed:.3f}s",
+                    flush=True,
+                )
+            finally:
+                discovery_sock.close()
+        return None, ""
+
+    def run(self) -> None:
+        frontend_addr, frontend_id = self._try_discover_frontend()
 
         if frontend_addr is not None:
             print(
@@ -1093,17 +1158,41 @@ class DistributedServer:
             ).run()
             return
 
-        self.elect_frontend_ring_initial()
         frontend_id = f"frontend-{self.port}-{self.node_id}"
+        try:
+            fe_server = FrontendServer(
+                self.port,
+                frontend_id=frontend_id,
+                cluster_config=self.cluster_config,
+            )
+        except OSError as exc:
+            print(
+                f"frontend_bind_busy node_id {self.node_id} port {self.port} "
+                f"error {exc}",
+                flush=True,
+            )
+            frontend_addr, frontend_id = self._try_discover_frontend()
+            if frontend_addr is not None:
+                print(
+                    f"frontend_discovered frontend_id {frontend_id} "
+                    f"addr {frontend_addr[0]}:{frontend_addr[1]}",
+                    flush=True,
+                )
+                ReplicaManagerNode(
+                    self.node_id,
+                    frontend_addr,
+                    frontend_id,
+                    self.cluster_config,
+                ).run()
+                return
+            raise
+
+        self.elect_frontend_ring_initial()
         print(
             f"frontend_starting frontend_id {frontend_id} port {self.port}",
             flush=True,
         )
-        FrontendServer(
-            self.port,
-            frontend_id=frontend_id,
-            cluster_config=self.cluster_config,
-        ).run()
+        fe_server.run()
 
 
 def _is_uint(value: Any) -> bool:

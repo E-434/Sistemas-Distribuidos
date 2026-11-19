@@ -24,14 +24,15 @@ macOS. Não há dependência de APIs específicas do Windows.
 
 ## Arquivos
 
-- `src/cliente.py`: gera um `client_id`, descobre o front-end (com
-  redescoberta automática após timeouts repetidos) e envia operações
-  stop-and-wait com `request_id`.
+- `src/cliente.py`: gera um `client_id`, realiza múltiplas tentativas na
+  descoberta inicial do front-end (com redescoberta automática após timeouts
+  repetidos) e envia operações stop-and-wait com `request_id`.
 - `src/servidor.py`: servidor UDP unificado. Contém o **FrontendServer**
   (sequenciador + disseminador + coletor de quórum + gestão do anel) e o
   **ReplicaManagerNode** (réplica ativa que aplica a sequência + detecção de
   falha do FE + eleição em anel + promoção a FE), além da
-  descoberta/eleição.
+  descoberta/eleição e logs detalhados de tentativas (`discovery_attempt` e
+  `discovery_result`).
 - `src/replica_manager.py`: entrypoint legado desativado; a implementação do RM
   foi incorporada a `src/servidor.py`.
 - `src/descoberta.py`: descoberta do front-end por broadcast + loopback e
@@ -52,7 +53,10 @@ macOS. Não há dependência de APIs específicas do Windows.
 ## Execução
 
 Inicie todos os servidores com o mesmo comando e a mesma porta externa. O
-primeiro nó sem FE detectável promove-se a FE; os próximos se registram como RMs:
+primeiro nó sem FE detectável promove-se a FE; os próximos se registram como RMs.
+O socket do FE ocupa exclusivamente a porta externa: se dois nós iniciarem ao
+mesmo tempo e disputarem a abertura, quem encontrar a porta ocupada recua para
+nova descoberta e ingressa como RM.
 
 ```bash
 python3 src/servidor.py 4000      # vira FE
@@ -119,22 +123,28 @@ Datagramas são objetos JSON UTF-8 com `version: 2`.
   e respondidos imediatamente, sem alterar a soma.
 - Cada RM aplica estritamente `last_applied_seq_id + 1` e registra o histórico
   por `client_id`. `ORDERED_REQUEST` fora de ordem vai para o **hold-back
-  buffer**; lacunas disparam **NACK**, e o FE retransmite a partir do seu **log
-  de operações**. Reentregas são ignoradas de forma idempotente.
+  buffer**; lacunas disparam **NACK** (pausadas durante eleição ativa e com
+  *cooldown* para sequências ainda indisponíveis no log do FE), e o FE retransmite
+  a partir do seu **log de operações**. Reentregas são ignoradas de forma
+  idempotente.
 - O FE confirma a operação ao cliente quando `quórum` réplicas têm
   `last_applied_seq_id >= seq_id`. Se o prazo expira sem quórum, o FE responde
   assim mesmo (o resultado é correto pela ordem total) e registra `quorum_timeout`.
 - Na promoção de um RM a FE, `num_reqs`, `total_sum`, `next_seq_id` e o
-  histórico de `clients` são preservados a partir do estado replicado.
+  histórico de `clients` são preservados a partir do estado replicado. Se um
+  cliente já ativo enviar o próximo `request_id` após falha do líder anterior e
+  seu registro ainda não constar no mapa local do novo FE com `num_reqs > 0`, o
+  FE alinha o estado do cliente para evitar rejeição indevida por
+  `OUT_OF_ORDER`.
 
 ## Estado da implementação
 
 Implementado: sequenciamento global, disseminação unicast, **aplicação da soma
 em todos os RMs**, **quórum de processamento**, recuperação de operações perdidas
-por hold-back/NACK, detecção de divergência, **eleição em anel por maior IP com
-pulo de nó inativo**, **failover/promoção do novo FE preservando estado** e
-redescoberta de FE no cliente. O serviço permanece utilizável sem
-réplicas (o FE responde imediatamente).
+por hold-back/NACK (com prevenção de loops de NACK), detecção de divergência,
+**eleição em anel por maior IP com pulo de nó inativo**, **failover/promoção do
+novo FE preservando estado** e redescoberta de FE no cliente. O serviço permanece
+utilizável sem réplicas (o FE responde imediatamente).
 
 **Fora do escopo desta etapa** (próximos passos): transferência de estado por
 snapshot para um RM que entra depois que o log de operações já foi truncado.

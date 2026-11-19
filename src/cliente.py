@@ -7,6 +7,7 @@ import queue
 import socket
 import sys
 import threading
+import time
 import uuid
 from typing import Final
 
@@ -23,6 +24,8 @@ from protocolo import STATUS_DUPLICATE, STATUS_PROCESSED
 
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 0.010
 REDISCOVER_AFTER_RETRIES: Final[int] = 5
+STARTUP_DISCOVERY_ATTEMPTS: Final[int] = 25
+STARTUP_DISCOVERY_RETRY_DELAY_SECONDS: Final[float] = 0.2
 
 _SENTINEL = object()
 
@@ -190,13 +193,45 @@ class DistributedClient:
         except OSError:
             self.stop_event.set()
 
+    def _discover_initial_frontend(self) -> tuple[tuple[str, int], str]:
+        last_exc: RuntimeError | None = None
+        for attempt in range(1, STARTUP_DISCOVERY_ATTEMPTS + 1):
+            t0 = time.monotonic()
+            print(
+                f"discovery_attempt client_id {self.client_id} "
+                f"attempt {attempt}/{STARTUP_DISCOVERY_ATTEMPTS} port {self.port}",
+                flush=True,
+            )
+            try:
+                addr, fid = discover_frontend(
+                    self.sock,
+                    self.port,
+                    self.client_id,
+                )
+                elapsed = time.monotonic() - t0
+                print(
+                    f"discovery_result client_id {self.client_id} attempt {attempt} "
+                    f"status found frontend_id {fid} addr {addr[0]}:{addr[1]} "
+                    f"elapsed {elapsed:.3f}s",
+                    flush=True,
+                )
+                return addr, fid
+            except RuntimeError as exc:
+                last_exc = exc
+                elapsed = time.monotonic() - t0
+                print(
+                    f"discovery_result client_id {self.client_id} attempt {attempt} "
+                    f"status not_found elapsed {elapsed:.3f}s",
+                    flush=True,
+                )
+                if attempt < STARTUP_DISCOVERY_ATTEMPTS:
+                    time.sleep(STARTUP_DISCOVERY_RETRY_DELAY_SECONDS)
+        assert last_exc is not None
+        raise last_exc
+
     def run(self) -> None:
         try:
-            self.server_addr, self.frontend_id = discover_frontend(
-                self.sock,
-                self.port,
-                self.client_id,
-            )
+            self.server_addr, self.frontend_id = self._discover_initial_frontend()
         except RuntimeError as exc:
             print(f"Erro: {exc}", file=sys.stderr)
             self.sock.close()
