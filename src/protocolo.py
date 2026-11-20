@@ -140,6 +140,8 @@ def make_replica_registered(
     frontend_id: str,
     accepted: bool,
     members: list[dict[str, Any]] | None = None,
+    state_snapshot: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> bytes:
     payload: dict[str, Any] = {
         "type": TYPE_REPLICA_REGISTERED,
@@ -149,6 +151,23 @@ def make_replica_registered(
     }
     if members is not None:
         payload["members"] = members
+    if state_snapshot is not None:
+        payload["state_snapshot"] = state_snapshot
+
+    if history:
+        bounded_history: list[dict[str, Any]] = []
+        for entry in reversed(history):
+            candidate_history = list(reversed(bounded_history)) + [entry]
+            payload["history"] = candidate_history
+            try:
+                encode_message(payload)
+                bounded_history.append(entry)
+            except ValueError:
+                payload["history"] = list(reversed(bounded_history))
+                break
+        if not payload.get("history"):
+            payload.pop("history", None)
+
     return encode_message(payload)
 
 

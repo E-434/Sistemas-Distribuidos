@@ -58,6 +58,8 @@ OP_LOG_MAX: Final[int] = 200_000
 NACK_MAX_SEQS: Final[int] = 256
 NACK_MIN_INTERVAL_SECONDS: Final[float] = 0.1
 NACK_UNSATISFIABLE_COOLDOWN_SECONDS: Final[float] = 5.0
+PROMOTE_BIND_ATTEMPTS: Final[int] = 8
+PROMOTE_BIND_RETRY_DELAY_SECONDS: Final[float] = 0.05
 REGISTRATION_TIMEOUT_SECONDS: Final[float] = 1.0
 REGISTRATION_ATTEMPTS: Final[int] = 5
 STARTUP_DISCOVERY_ATTEMPTS: Final[int] = 2
@@ -152,6 +154,37 @@ class FrontendServer:
                         status="active",
                     )
 
+    def _state_snapshot_payload(self) -> dict[str, Any]:
+        clients_payload: dict[str, dict[str, int]] = {}
+        for cid, cstate in self.processor.clients.items():
+            clients_payload[cid] = {
+                "last_request_id": cstate.last_request_id,
+                "last_seq_id": cstate.last_seq_id,
+                "last_num_reqs": cstate.last_num_reqs,
+                "last_total_sum": cstate.last_total_sum,
+            }
+        return {
+            "num_reqs": self.processor.num_reqs,
+            "total_sum": self.processor.total_sum,
+            "last_applied_seq_id": max(0, self.processor.next_seq_id - 1),
+            "clients": clients_payload,
+        }
+
+    def _history_payload(self) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for seq_id in self.op_log_order:
+            item = self.op_log.get(seq_id)
+            if item is not None:
+                entries.append(
+                    {
+                        "seq_id": seq_id,
+                        "client_id": item["client_id"],
+                        "request_id": item["request_id"],
+                        "value": item["value"],
+                    }
+                )
+        return entries
+
     def _ring_members_payload(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         for replica in self.active_replicas().values():
@@ -191,29 +224,6 @@ class FrontendServer:
         message: dict[str, Any],
         sender: tuple[str, int],
     ) -> None:
-        client_id = message.get("client_id")
-        request_id = message.get("request_id")
-        if (
-            isinstance(client_id, str)
-            and client_id
-            and isinstance(request_id, int)
-            and not isinstance(request_id, bool)
-            and request_id > 1
-            and client_id not in self.processor.clients
-            and self.processor.num_reqs > 0
-        ):
-            self.processor.clients[client_id] = ClientState(
-                last_request_id=request_id - 1,
-                last_seq_id=self.processor.next_seq_id - 1,
-                last_num_reqs=self.processor.num_reqs,
-                last_total_sum=self.processor.total_sum,
-            )
-            print(
-                f"failover_client_synced client_id {client_id} "
-                f"assumed_last_request_id {request_id - 1}",
-                flush=True,
-            )
-
         response, event = self.processor.process_request(message, sender)
         if event is not None:
             print(server_processing_event(event), flush=True)
@@ -396,11 +406,12 @@ class FrontendServer:
             )
             self.sock.sendto(packet, sender)
             resent += 1
-        print(
-            f"nack_handled node_id {node_id} resent {resent} "
-            f"unsatisfiable {unsatisfiable}",
-            flush=True,
-        )
+        if resent > 0 or unsatisfiable == 0:
+            print(
+                f"nack_handled node_id {node_id} resent {resent} "
+                f"unsatisfiable {unsatisfiable}",
+                flush=True,
+            )
 
     def process_replica_heartbeat(
         self,
@@ -500,9 +511,16 @@ class FrontendServer:
             node_id = node_id if isinstance(node_id, str) else "invalid"
 
         members_payload = self._ring_members_payload() if accepted else None
+        snapshot_payload = self._state_snapshot_payload() if accepted else None
+        history_payload = self._history_payload() if accepted else None
         self.sock.sendto(
             make_replica_registered(
-                node_id, self.frontend_id, accepted, members=members_payload
+                node_id,
+                self.frontend_id,
+                accepted,
+                members=members_payload,
+                state_snapshot=snapshot_payload,
+                history=history_payload,
             ),
             sender,
         )
@@ -638,6 +656,7 @@ class ReplicaManagerNode:
             if (
                 isinstance(nid, str)
                 and nid
+                and nid != self.frontend_id
                 and isinstance(ip, str)
                 and ip
                 and isinstance(rport, int)
@@ -649,6 +668,79 @@ class ReplicaManagerNode:
         self.ring.members = sorted(
             by_id.values(), key=lambda m: (m.node_id, m.ip, m.port)
         )
+        self.ring.hop_offset = 1
+
+    def _apply_snapshot_and_history(
+        self,
+        snapshot: Any,
+        history: Any,
+    ) -> None:
+        if isinstance(snapshot, dict):
+            num_reqs = snapshot.get("num_reqs")
+            total_sum = snapshot.get("total_sum")
+            last_applied = snapshot.get("last_applied_seq_id")
+            if (
+                _is_uint(num_reqs)
+                and _is_uint(total_sum)
+                and _is_uint(last_applied)
+                and cast(int, last_applied) > self.state.last_applied_seq_id
+            ):
+                self.state.num_reqs = cast(int, num_reqs)
+                self.state.total_sum = cast(int, total_sum)
+                self.state.last_applied_seq_id = cast(int, last_applied)
+
+            clients_data = snapshot.get("clients")
+            if isinstance(clients_data, dict):
+                for cid, cinfo in clients_data.items():
+                    if not isinstance(cid, str) or not isinstance(cinfo, dict):
+                        continue
+                    l_req = cinfo.get("last_request_id")
+                    l_seq = cinfo.get("last_seq_id")
+                    l_num = cinfo.get("last_num_reqs")
+                    l_sum = cinfo.get("last_total_sum")
+                    if (
+                        _is_uint(l_req)
+                        and _is_uint(l_seq)
+                        and _is_uint(l_num)
+                        and _is_uint(l_sum)
+                    ):
+                        existing = self.state.clients.get(cid)
+                        if existing is None or cast(int, l_req) > existing.last_request_id:
+                            self.state.clients[cid] = ClientState(
+                                last_request_id=cast(int, l_req),
+                                last_seq_id=cast(int, l_seq),
+                                last_num_reqs=cast(int, l_num),
+                                last_total_sum=cast(int, l_sum),
+                            )
+
+        if isinstance(history, list):
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                seq_id = item.get("seq_id")
+                client_id = item.get("client_id")
+                request_id = item.get("request_id")
+                value = item.get("value")
+                if (
+                    _is_uint(seq_id)
+                    and cast(int, seq_id) > 0
+                    and isinstance(client_id, str)
+                    and client_id
+                    and _is_uint(request_id)
+                    and cast(int, request_id) > 0
+                    and _is_uint(value)
+                ):
+                    sid = cast(int, seq_id)
+                    if sid > self.state.last_applied_seq_id:
+                        self.holdback[sid] = (
+                            cast(int, value),
+                            client_id,
+                            cast(int, request_id),
+                        )
+            self.drain_apply()
+
+        if self.state.last_applied_seq_id > 0:
+            self.send_applied_ack()
 
     def register(self) -> None:
         packet = make_replica_register(
@@ -682,6 +774,10 @@ class ReplicaManagerNode:
                 members = message.get("members")
                 if isinstance(members, list):
                     self._ingest_members(members)
+                self._apply_snapshot_and_history(
+                    message.get("state_snapshot"),
+                    message.get("history"),
+                )
                 return
         raise RuntimeError(
             f"não foi possível registrar {self.node_id} no front-end "
@@ -689,6 +785,8 @@ class ReplicaManagerNode:
         )
 
     def send_applied_ack(self) -> None:
+        if self._promoted_frontend is not None:
+            return
         self.sock.sendto(
             make_replica_applied_ack(
                 self.node_id,
@@ -701,6 +799,8 @@ class ReplicaManagerNode:
         )
 
     def send_heartbeat(self) -> None:
+        if self._promoted_frontend is not None:
+            return
         self.sock.sendto(
             make_replica_heartbeat(self.node_id, self.frontend_id),
             self.frontend_addr,
@@ -725,7 +825,11 @@ class ReplicaManagerNode:
             self.send_applied_ack()
 
     def request_missing(self, force: bool = False) -> None:
-        if self.ring.election_active or not self.holdback:
+        if (
+            self._promoted_frontend is not None
+            or self.ring.election_active
+            or not self.holdback
+        ):
             return
         head = self.state.last_applied_seq_id + 1
         if head in self.holdback:
@@ -821,7 +925,7 @@ class ReplicaManagerNode:
         )
         self._send_election_to_hop(self.ring.candidate, self.node_id)
 
-    def _promote_to_frontend(self, leader_id: str, leader_port: int) -> None:
+    def _promote_to_frontend(self, leader_id: str, leader_port: int) -> bool:
         members_data = [
             {
                 "node_id": m.node_id,
@@ -829,16 +933,31 @@ class ReplicaManagerNode:
                 "ring_port": m.port,
             }
             for m in self.ring.members
-            if m.node_id != self.node_id
+            if m.node_id != self.node_id and m.node_id != leader_id
         ]
+        fe_sock: socket.socket | None = None
+        last_exc: OSError | None = None
+        for _ in range(PROMOTE_BIND_ATTEMPTS):
+            candidate_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                candidate_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                candidate_sock.bind(("", leader_port))
+                fe_sock = candidate_sock
+                break
+            except OSError as exc:
+                last_exc = exc
+                candidate_sock.close()
+                time.sleep(PROMOTE_BIND_RETRY_DELAY_SECONDS)
+
+        if fe_sock is None:
+            print(
+                f"promote_bind_failed node_id {self.node_id} port {leader_port} "
+                f"error {last_exc}",
+                flush=True,
+            )
+            return False
+
         self.sock.close()
-        fe_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            fe_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            fe_sock.bind(("", leader_port))
-        except OSError:
-            fe_sock.close()
-            raise
         self._promoted_frontend = FrontendServer(
             port=leader_port,
             frontend_id=leader_id,
@@ -853,10 +972,12 @@ class ReplicaManagerNode:
             f"total_sum {self.state.total_sum}",
             flush=True,
         )
+        return True
 
     def _announce_coordinator(self, winner: RingNodeInfo) -> None:
         self.ring.election_active = False
         self.ring.pending_target = None
+        self.ring.hop_offset = 1
         target = self.ring.next_hop(offset=1)
         packet = make_coordinator(
             sender_id=self.node_id,
@@ -871,21 +992,31 @@ class ReplicaManagerNode:
             flush=True,
         )
         if winner.node_id == self.node_id:
-            self._promote_to_frontend(self.node_id, self.frontend_addr[1])
-            if target.node_id != self.node_id and self._promoted_frontend is not None:
-                try:
-                    self._promoted_frontend.sock.sendto(packet, (target.ip, target.port))
-                except OSError:
-                    pass
-        else:
-            self.frontend_id = winner.node_id
-            self.frontend_addr = (winner.ip, self.frontend_addr[1])
-            self.membership.leader_id = winner.node_id
-            self._last_fe_contact = time.monotonic()
+            promoted = self._promote_to_frontend(self.node_id, self.frontend_addr[1])
+            if promoted and self._promoted_frontend is not None:
+                if target.node_id != self.node_id:
+                    try:
+                        self._promoted_frontend.sock.sendto(
+                            packet, (target.ip, target.port)
+                        )
+                    except OSError:
+                        pass
+                return
+            self.frontend_id = f"frontend-{self.frontend_addr[1]}-busy"
+            self._last_fe_contact = (
+                time.monotonic() - self.cluster_config.heartbeat_timeout_seconds
+            )
             self._fe_failed_reported = False
-            self.ring.remove_member(winner.node_id)
-            if target.node_id != self.node_id:
-                self.sock.sendto(packet, (target.ip, target.port))
+            return
+
+        self.frontend_id = winner.node_id
+        self.frontend_addr = (winner.ip, self.frontend_addr[1])
+        self.membership.leader_id = winner.node_id
+        self._last_fe_contact = time.monotonic()
+        self._fe_failed_reported = False
+        self.ring.remove_member(winner.node_id)
+        if target.node_id != self.node_id:
+            self.sock.sendto(packet, (target.ip, target.port))
 
     def _handle_election_msg(
         self,
@@ -959,6 +1090,7 @@ class ReplicaManagerNode:
         self.ring.election_active = False
         self.ring.pending_target = None
         self.ring.remove_member(leader_id)
+        self.ring.hop_offset = 1
         self.frontend_id = leader_id
         self.frontend_addr = (leader_ip, leader_port)
         self.membership.leader_id = leader_id
@@ -1017,6 +1149,10 @@ class ReplicaManagerNode:
             self.sock.settimeout(min(0.1, interval))
             next_heartbeat = time.monotonic()
             while True:
+                if self._promoted_frontend is not None:
+                    self._promoted_frontend.run()
+                    return
+
                 now = time.monotonic()
                 if not self.ring.election_active:
                     if now >= next_heartbeat:
@@ -1037,6 +1173,10 @@ class ReplicaManagerNode:
                         self.start_election()
 
                 self._check_election_ack_timeout(now)
+                if self._promoted_frontend is not None:
+                    self._promoted_frontend.run()
+                    return
+
                 self.request_missing()
 
                 try:
@@ -1045,6 +1185,11 @@ class ReplicaManagerNode:
                     continue
                 except socket.timeout:
                     continue
+                except OSError:
+                    if self._promoted_frontend is not None:
+                        self._promoted_frontend.run()
+                        return
+                    raise
 
                 message = decode_message(data)
                 if message is None:

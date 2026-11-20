@@ -28,9 +28,10 @@ macOS. Não há dependência de APIs específicas do Windows.
   descoberta inicial do front-end (com redescoberta automática após timeouts
   repetidos) e envia operações stop-and-wait com `request_id`.
 - `src/servidor.py`: servidor UDP unificado. Contém o **FrontendServer**
-  (sequenciador + disseminador + coletor de quórum + gestão do anel) e o
-  **ReplicaManagerNode** (réplica ativa que aplica a sequência + detecção de
-  falha do FE + eleição em anel + promoção a FE), além da
+  (sequenciador + disseminador + coletor de quórum + gestão do anel + envio de
+  estado/histórico no registro de RMs) e o **ReplicaManagerNode** (réplica
+  ativa que sincroniza estado inicial ao registrar, aplica a sequência +
+  detecção de falha do FE + eleição em anel + promoção a FE), além da
   descoberta/eleição e logs detalhados de tentativas (`discovery_attempt` e
   `discovery_result`).
 - `src/replica_manager.py`: entrypoint legado desativado; a implementação do RM
@@ -41,7 +42,8 @@ macOS. Não há dependência de APIs específicas do Windows.
   cliente no FE (`RequestProcessor`) e a máquina de estados replicada
   (`ReplicatedSumState`, preservando estado por cliente).
 - `src/protocolo.py`: mensagens versionadas dos canais externo, intra-cluster e
-  eleição em anel.
+  eleição em anel (incluindo `state_snapshot` e `history` limitados ao
+  tamanho máximo do datagrama em `REPLICA_REGISTERED`).
 - `src/arquitetura.py`: identidades, descritores, membership, anel
   (`RingTopology` e `RingNodeInfo`), chave por IP (`ip_priority_key`), quórum
   e trackers.
@@ -103,7 +105,10 @@ Datagramas são objetos JSON UTF-8 com `version: 2`.
 **Canal FE<->RM e Eleição em Anel**
 
 4. `REPLICA_REGISTER` / `REPLICA_REGISTERED`: o RM registra a sua porta efêmera
-   de escuta (e porta do anel); o FE confirma e retorna os membros do anel.
+   de escuta (e porta do anel); o FE confirma e retorna os membros do anel,
+   além de `state_snapshot` (`num_reqs`, `total_sum`, `last_applied_seq_id` e
+   `clients`) e operações recentes de `history` que caibam no limite de
+   datagrama.
 5. `ORDERED_REQUEST` (`seq_id`, `client_id`, `request_id`, `value`): operação
    ordenada enviada a cada RM ativo.
 6. `REPLICA_APPLIED_ACK` (`last_applied_seq_id`, `num_reqs`, `total_sum`): o RM
@@ -118,6 +123,10 @@ Datagramas são objetos JSON UTF-8 com `version: 2`.
 
 **Observações**
 
+- Assim que um novo RM se conecta e é aceito via `REPLICA_REGISTERED`, ele
+  incorpora o `state_snapshot` e aplica em ordem as operações recebidas em
+  `history`, enviando `REPLICA_APPLIED_ACK` para alinhar seu progresso com o
+  FE.
 - O FE só incrementa `seq_id` ao aceitar uma requisição na ordem esperada do
   cliente; reenvios de `request_id` já processados são tratados como duplicatas
   e respondidos imediatamente, sem alterar a soma.
@@ -143,11 +152,9 @@ Implementado: sequenciamento global, disseminação unicast, **aplicação da so
 em todos os RMs**, **quórum de processamento**, recuperação de operações perdidas
 por hold-back/NACK (com prevenção de loops de NACK), detecção de divergência,
 **eleição em anel por maior IP com pulo de nó inativo**, **failover/promoção do
-novo FE preservando estado** e redescoberta de FE no cliente. O serviço permanece
-utilizável sem réplicas (o FE responde imediatamente).
-
-**Fora do escopo desta etapa** (próximos passos): transferência de estado por
-snapshot para um RM que entra depois que o log de operações já foi truncado.
+novo FE preservando estado**, sincronização de estado na conexão de novos RMs
+e redescoberta de FE no cliente. O serviço permanece utilizável sem réplicas (o
+FE responde imediatamente).
 
 ## Teste de integração
 
