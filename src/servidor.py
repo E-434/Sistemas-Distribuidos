@@ -188,6 +188,8 @@ class FrontendServer:
     def _ring_members_payload(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         for replica in self.active_replicas().values():
+            if replica.node_id == self.frontend_id:
+                continue
             payload.append(
                 {
                     "node_id": replica.node_id,
@@ -201,6 +203,8 @@ class FrontendServer:
         members = self._ring_members_payload()
         packet = make_ring_members(self.frontend_id, members)
         for replica in self.active_replicas().values():
+            if replica.node_id == self.frontend_id:
+                continue
             target_port = replica.ring_port or replica.port
             try:
                 self.sock.sendto(packet, (replica.host, target_port))
@@ -215,7 +219,8 @@ class FrontendServer:
         return {
             node_id: replica
             for node_id, replica in self.registered_replicas.items()
-            if replica.status == "active"
+            if node_id != self.frontend_id
+            and replica.status == "active"
             and now - replica.last_seen < self.cluster_config.heartbeat_timeout_seconds
         }
 
@@ -476,6 +481,7 @@ class FrontendServer:
             isinstance(node_id, str)
             and bool(node_id)
             and len(node_id) <= 128
+            and node_id != self.frontend_id
             and isinstance(listen_port, int)
             and not isinstance(listen_port, bool)
             and 1 <= listen_port <= 65535
@@ -536,6 +542,7 @@ class FrontendServer:
             ),
             flush=True,
         )
+        self.broadcast_ring_members()
         try:
             while True:
                 try:
@@ -977,6 +984,7 @@ class ReplicaManagerNode:
     def _announce_coordinator(self, winner: RingNodeInfo) -> None:
         self.ring.election_active = False
         self.ring.pending_target = None
+        self.ring.remove_member(winner.node_id)
         self.ring.hop_offset = 1
         target = self.ring.next_hop(offset=1)
         packet = make_coordinator(
@@ -1014,7 +1022,6 @@ class ReplicaManagerNode:
         self.membership.leader_id = winner.node_id
         self._last_fe_contact = time.monotonic()
         self._fe_failed_reported = False
-        self.ring.remove_member(winner.node_id)
         if target.node_id != self.node_id:
             self.sock.sendto(packet, (target.ip, target.port))
 
@@ -1087,6 +1094,11 @@ class ReplicaManagerNode:
         ):
             return
 
+        already_known = (
+            not self.ring.election_active
+            and self.frontend_id == leader_id
+            and self.frontend_addr == (leader_ip, leader_port)
+        )
         self.ring.election_active = False
         self.ring.pending_target = None
         self.ring.remove_member(leader_id)
@@ -1096,6 +1108,10 @@ class ReplicaManagerNode:
         self.membership.leader_id = leader_id
         self._last_fe_contact = time.monotonic()
         self._fe_failed_reported = False
+
+        if already_known:
+            return
+
         print(
             f"coordinator_recognized node_id {self.node_id} leader_id {leader_id} "
             f"addr {leader_ip}:{leader_port}",
@@ -1154,7 +1170,10 @@ class ReplicaManagerNode:
                     return
 
                 now = time.monotonic()
-                if not self.ring.election_active:
+                if (
+                    not self.ring.election_active
+                    and self.frontend_id != self.node_id
+                ):
                     if now >= next_heartbeat:
                         self.send_heartbeat()
                         next_heartbeat = now + interval
