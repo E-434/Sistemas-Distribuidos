@@ -6,10 +6,10 @@ envia cada requisição respeitando o protocolo stop-and-wait (esperando o ACK c
 e valida o resultado final contra a soma acumulada esperada.
 
 Uso:
-    python3 benchmark_file.py <porta_udp> [caminho_arquivo]
+    python3 Benchmark_file.py <porta_udp> [caminho_arquivo]
 
 Exemplo:
-    python3 benchmark_file.py 4000 RAND_NUM_1.txt
+    python3 Benchmark_file.py 4000 RAND_NUM_1.txt
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from protocolo import (
 
 BUFFER_SIZE: Final[int] = 4096
 REQUEST_TIMEOUT: Final[float] = 0.100
+REDISCOVER_AFTER_RETRIES: Final[int] = 5
 
 
 def now() -> str:
@@ -51,7 +52,10 @@ def load_numbers_from_file(filepath: str) -> List[int]:
             try:
                 numbers.append(int(line))
             except ValueError:
-                print(f"Aviso: Linha {line_num} ignorada (não é inteiro válido): {line!r}", file=sys.stderr)
+                print(
+                    f"Aviso: Linha {line_num} ignorada (não é inteiro válido): {line!r}",
+                    file=sys.stderr,
+                )
 
     if not numbers:
         print(f"Erro: Nenhum número válido encontrado em '{filepath}'.", file=sys.stderr)
@@ -67,13 +71,18 @@ def wait_for_ack(
     request_id: int,
 ) -> Optional[dict]:
     """Espera o resultado correspondente ao request_id especificado."""
+    loopback_ips = {"127.0.0.1", "0.0.0.0", "localhost"}
     while True:
         try:
             data, sender = sock.recvfrom(BUFFER_SIZE)
+        except ConnectionResetError:
+            continue
         except socket.timeout:
             return None
 
-        if sender[0] != frontend_addr[0]:
+        if sender[0] != frontend_addr[0] and not (
+            sender[0] in loopback_ips and frontend_addr[0] in loopback_ips
+        ):
             continue
 
         message = decode_message(data)
@@ -92,7 +101,10 @@ def wait_for_ack(
 
 def main() -> None:
     if len(sys.argv) < 2 or len(sys.argv) > 3:
-        print(f"Uso: python3 {sys.argv[0]} <porta_udp> [caminho_arquivo.txt]", file=sys.stderr)
+        print(
+            f"Uso: python3 {sys.argv[0]} <porta_udp> [caminho_arquivo.txt]",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
 
     try:
@@ -120,7 +132,7 @@ def main() -> None:
         server_addr, frontend_id = discover_frontend(sock, port, client_id)
         server_ip = server_addr[0]
 
-        print(f"{now()} Servidor encontrado em {server_ip}:{port}")
+        print(f"{now()} Servidor encontrado em {server_ip}:{server_addr[1]}")
         print(f"Front-end: {frontend_id}")
         print(f"Benchmark: {total_requests:,} requisições a serem enviadas.")
         print(f"Soma esperada no conjunto de números: {expected_total_sum:,}")
@@ -136,6 +148,7 @@ def main() -> None:
 
         for req_id, value in enumerate(numbers, start=1):
             packet = make_sum_request(client_id, req_id, value)
+            retries_without_ack = 0
 
             while True:
                 sock.settimeout(REQUEST_TIMEOUT)
@@ -148,13 +161,30 @@ def main() -> None:
                     break
 
                 retransmissions += 1
+                retries_without_ack += 1
+                if retries_without_ack >= REDISCOVER_AFTER_RETRIES:
+                    retries_without_ack = 0
+                    try:
+                        new_addr, new_fe_id = discover_frontend(
+                            sock, port, client_id
+                        )
+                        if new_addr != server_addr or new_fe_id != frontend_id:
+                            server_addr = new_addr
+                            frontend_id = new_fe_id
+                            print(
+                                f"{now()} Novo front-end: {server_addr[0]}:{server_addr[1]} "
+                                f"({frontend_id})",
+                                flush=True,
+                            )
+                    except RuntimeError:
+                        pass
 
             if req_id % log_interval == 0 or req_id == total_requests:
                 elapsed = time.perf_counter() - start
                 rate = req_id / elapsed if elapsed > 0 else 0.0
                 print(
                     f"{now()} Progresso {req_id:,}/{total_requests:,} "
-                    f"({(req_id/total_requests)*100:.1f}%) | "
+                    f"({(req_id / total_requests) * 100:.1f}%) | "
                     f"Taxa: {rate:,.0f} req/s | "
                     f"Retransmissões: {retransmissions}",
                     flush=True,
@@ -179,10 +209,17 @@ def main() -> None:
         print(f"Servidor total_sum:    {received_total_sum}")
         print("=" * 64)
 
-        if received_num_reqs == total_requests and received_total_sum == expected_total_sum:
-            print("RESULTADO: OK! Todos os números foram processados e somados corretamente.")
+        if (
+            received_num_reqs == total_requests
+            and received_total_sum == expected_total_sum
+        ):
+            print(
+                "RESULTADO: OK! Todos os números foram processados e somados corretamente."
+            )
         else:
-            print("RESULTADO: DIVERGÊNCIA! Os valores retornados pelo servidor diferem do esperado.")
+            print(
+                "RESULTADO: DIVERGÊNCIA! Os valores retornados pelo servidor diferem do esperado."
+            )
             raise SystemExit(1)
 
     finally:

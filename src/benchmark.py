@@ -16,8 +16,9 @@ esperado é:
     num_reqs  = 1_000_000
     total_sum = 1_000_000
 
-Se a resposta for perdida, a mesma requisição é retransmitida. O front-end
-deduplica por client_id/request_id para não somá-la duas vezes.
+Se a resposta for perdida ou o front-end falhar, a mesma requisição é
+retransmitida e o cliente redescobre o novo front-end após falhas consecutivas.
+O front-end deduplica por client_id/request_id para não somá-la duas vezes.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from protocolo import (
 
 BUFFER_SIZE: Final[int] = 4096
 REQUEST_TIMEOUT: Final[float] = 0.100
+REDISCOVER_AFTER_RETRIES: Final[int] = 5
 
 # Um valor fixo facilita comparar execuções do benchmark.
 NUM_REQUESTS: Final[int] = 1_000_000
@@ -54,13 +56,18 @@ def wait_for_ack(
     request_id: int,
 ) -> dict | None:
     """Espera o resultado correspondente ao request_id."""
+    loopback_ips = {"127.0.0.1", "0.0.0.0", "localhost"}
     while True:
         try:
             data, sender = sock.recvfrom(BUFFER_SIZE)
+        except ConnectionResetError:
+            continue
         except socket.timeout:
             return None
 
-        if sender[0] != frontend_addr[0]:
+        if sender[0] != frontend_addr[0] and not (
+            sender[0] in loopback_ips and frontend_addr[0] in loopback_ips
+        ):
             continue
 
         message = decode_message(data)
@@ -116,6 +123,7 @@ def main() -> None:
 
         for req_id in range(1, NUM_REQUESTS + 1):
             packet = make_sum_request(client_id, req_id, VALUE)
+            retries_without_ack = 0
 
             while True:
                 sock.settimeout(REQUEST_TIMEOUT)
@@ -128,6 +136,23 @@ def main() -> None:
                     break
 
                 retransmissions += 1
+                retries_without_ack += 1
+                if retries_without_ack >= REDISCOVER_AFTER_RETRIES:
+                    retries_without_ack = 0
+                    try:
+                        new_addr, new_fe_id = discover_frontend(
+                            sock, port, client_id
+                        )
+                        if new_addr != server_addr or new_fe_id != frontend_id:
+                            server_addr = new_addr
+                            frontend_id = new_fe_id
+                            print(
+                                f"{now()} frontend_addr {server_addr[0]} "
+                                f"frontend_id {frontend_id}",
+                                flush=True,
+                            )
+                    except RuntimeError:
+                        pass
 
             # Mostra o progresso em intervalos para evitar milhões de linhas.
             if req_id % 100_000 == 0 or req_id == NUM_REQUESTS:
@@ -143,8 +168,8 @@ def main() -> None:
         elapsed = time.perf_counter() - start
         rate = NUM_REQUESTS / elapsed if elapsed > 0 else 0.0
 
-        received_num_reqs = last_ack.get("num_reqs")
-        received_total_sum = last_ack.get("total_sum")
+        received_num_reqs = last_ack.get("num_reqs") if last_ack else None
+        received_total_sum = last_ack.get("total_sum") if last_ack else None
 
         print()
         print("========== RESULTADO ==========")

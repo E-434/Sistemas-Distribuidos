@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Protocolo UDP cliente/front-end e contratos reservados para o cluster."""
+"""Protocolo UDP cliente/front-end, replicação ativa e eleição em anel."""
 
 from __future__ import annotations
 
@@ -15,19 +15,23 @@ TYPE_FRONTEND_INFO = "FRONTEND_INFO"
 TYPE_SUM_REQUEST = "SUM_REQUEST"
 TYPE_SUM_RESULT = "SUM_RESULT"
 
-# Canal intra-cluster (FE <-> Replica Managers).
+# Canal intra-cluster (FE <-> Replica Managers)
 TYPE_ORDERED_REQUEST = "ORDERED_REQUEST"
 TYPE_REPLICA_ACK = "REPLICA_ACK"
 TYPE_REPLICA_REGISTER = "REPLICA_REGISTER"
 TYPE_REPLICA_REGISTERED = "REPLICA_REGISTERED"
 TYPE_REPLICA_HEARTBEAT = "REPLICA_HEARTBEAT"
+TYPE_REPLICA_HEARTBEAT_ACK = "REPLICA_HEARTBEAT_ACK"
 TYPE_REPLICA_RECEIPT_ACK = "REPLICA_RECEIPT_ACK"
-# Replicação ativa: a réplica confirma a APLICAÇÃO da operação (não só o
-# recebimento) e pede retransmissão de seq_ids perdidos via NACK.
 TYPE_REPLICA_APPLIED_ACK = "REPLICA_APPLIED_ACK"
 TYPE_REPLICA_NACK = "REPLICA_NACK"
 TYPE_HEARTBEAT = "HEARTBEAT"
+
+# Eleição em anel (critério: maior IP; desempate por porta/node_id)
 TYPE_ELECTION = "ELECTION"
+TYPE_ELECTION_ACK = "ELECTION_ACK"
+TYPE_COORDINATOR = "COORDINATOR"
+TYPE_RING_MEMBERS = "RING_MEMBERS"
 
 STATUS_PROCESSED = "PROCESSED"
 STATUS_DUPLICATE = "DUPLICATE"
@@ -116,35 +120,71 @@ def make_sum_result(
     )
 
 
-def make_replica_register(node_id: str, listen_port: int) -> bytes:
-    return encode_message(
-        {
-            "type": TYPE_REPLICA_REGISTER,
-            "node_id": node_id,
-            "listen_port": listen_port,
-        }
-    )
+def make_replica_register(
+    node_id: str,
+    listen_port: int,
+    ring_port: int | None = None,
+) -> bytes:
+    payload: dict[str, Any] = {
+        "type": TYPE_REPLICA_REGISTER,
+        "node_id": node_id,
+        "listen_port": listen_port,
+    }
+    if ring_port is not None:
+        payload["ring_port"] = ring_port
+    return encode_message(payload)
 
 
 def make_replica_registered(
     node_id: str,
     frontend_id: str,
     accepted: bool,
+    members: list[dict[str, Any]] | None = None,
+    state_snapshot: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> bytes:
-    return encode_message(
-        {
-            "type": TYPE_REPLICA_REGISTERED,
-            "node_id": node_id,
-            "frontend_id": frontend_id,
-            "accepted": accepted,
-        }
-    )
+    payload: dict[str, Any] = {
+        "type": TYPE_REPLICA_REGISTERED,
+        "node_id": node_id,
+        "frontend_id": frontend_id,
+        "accepted": accepted,
+    }
+    if members is not None:
+        payload["members"] = members
+    if state_snapshot is not None:
+        payload["state_snapshot"] = state_snapshot
+
+    if history:
+        bounded_history: list[dict[str, Any]] = []
+        for entry in reversed(history):
+            candidate_history = list(reversed(bounded_history)) + [entry]
+            payload["history"] = candidate_history
+            try:
+                encode_message(payload)
+                bounded_history.append(entry)
+            except ValueError:
+                payload["history"] = list(reversed(bounded_history))
+                break
+        if not payload.get("history"):
+            payload.pop("history", None)
+
+    return encode_message(payload)
 
 
 def make_replica_heartbeat(node_id: str, frontend_id: str) -> bytes:
     return encode_message(
         {
             "type": TYPE_REPLICA_HEARTBEAT,
+            "node_id": node_id,
+            "frontend_id": frontend_id,
+        }
+    )
+
+
+def make_replica_heartbeat_ack(node_id: str, frontend_id: str) -> bytes:
+    return encode_message(
+        {
+            "type": TYPE_REPLICA_HEARTBEAT_ACK,
             "node_id": node_id,
             "frontend_id": frontend_id,
         }
@@ -194,12 +234,6 @@ def make_replica_applied_ack(
     num_reqs: int,
     total_sum: int,
 ) -> bytes:
-    """ACK de APLICAÇÃO: a réplica confirma até onde seu estado está aplicado.
-
-    `last_applied_seq_id` é o progresso contíguo da réplica (todas as operações
-    de 1 a esse valor já foram somadas). `num_reqs`/`total_sum` são o estado
-    replicado resultante, usados pelo front-end para detectar divergência.
-    """
     return encode_message(
         {
             "type": TYPE_REPLICA_APPLIED_ACK,
@@ -217,12 +251,79 @@ def make_replica_nack(
     frontend_id: str,
     missing_seq_ids: list[int],
 ) -> bytes:
-    """Pedido de retransmissão dos seq_ids que a réplica não recebeu."""
     return encode_message(
         {
             "type": TYPE_REPLICA_NACK,
             "node_id": node_id,
             "frontend_id": frontend_id,
             "missing": missing_seq_ids,
+        }
+    )
+
+
+def make_election(
+    sender_id: str,
+    candidate_id: str,
+    candidate_ip: str,
+    candidate_port: int,
+    origin_id: str,
+    hop_index: int,
+) -> bytes:
+    return encode_message(
+        {
+            "type": TYPE_ELECTION,
+            "sender_id": sender_id,
+            "candidate_id": candidate_id,
+            "candidate_ip": candidate_ip,
+            "candidate_port": candidate_port,
+            "origin_id": origin_id,
+            "hop_index": hop_index,
+        }
+    )
+
+
+def make_election_ack(
+    sender_id: str,
+    origin_id: str,
+    hop_index: int,
+) -> bytes:
+    return encode_message(
+        {
+            "type": TYPE_ELECTION_ACK,
+            "sender_id": sender_id,
+            "origin_id": origin_id,
+            "hop_index": hop_index,
+        }
+    )
+
+
+def make_coordinator(
+    sender_id: str,
+    leader_id: str,
+    leader_ip: str,
+    leader_port: int,
+    origin_id: str,
+) -> bytes:
+    return encode_message(
+        {
+            "type": TYPE_COORDINATOR,
+            "sender_id": sender_id,
+            "leader_id": leader_id,
+            "leader_ip": leader_ip,
+            "leader_port": leader_port,
+            "origin_id": origin_id,
+        }
+    )
+
+
+def make_ring_members(
+    sender_id: str,
+    members: list[dict[str, Any]],
+) -> bytes:
+    return encode_message(
+        {
+            "type": TYPE_RING_MEMBERS,
+            "sender_id": sender_id,
+            "members": members,
         }
     )
