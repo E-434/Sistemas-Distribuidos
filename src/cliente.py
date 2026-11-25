@@ -14,7 +14,11 @@ from typing import Final
 from descoberta import discover_frontend
 from interface import (
     ack_received,
+    client_discovery_attempt,
+    client_discovery_result,
+    client_frontend_error,
     client_server_addr,
+    format_client_log,
     invalid_value,
     request_resent,
     request_sent,
@@ -39,6 +43,12 @@ class DistributedClient:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", 0))
+
+        local_ip, local_port = self.sock.getsockname()
+        if local_ip == "0.0.0.0":
+            local_ip = "127.0.0.1"
+        self.client_endpoint = f"{local_ip}:{local_port}"
 
         self.server_addr: tuple[str, int] | None = None
         self.frontend_id = ""
@@ -89,11 +99,11 @@ class DistributedClient:
             try:
                 value = int(line)
             except ValueError:
-                self.output_queue.put(invalid_value(line))
+                self.output_queue.put(invalid_value(self.client_endpoint, line))
                 continue
 
             if value <= 0 or value > UINT64_MAX:
-                self.output_queue.put(invalid_value(value))
+                self.output_queue.put(invalid_value(self.client_endpoint, value))
                 continue
 
             self.input_queue.put(value)
@@ -110,7 +120,10 @@ class DistributedClient:
         if new_addr != self.server_addr or new_fe_id != self.frontend_id:
             self.server_addr = new_addr
             self.frontend_id = new_fe_id
-            self.output_queue.put(client_server_addr(new_addr[0], new_fe_id))
+            fe_endpoint = f"{new_addr[0]}:{new_addr[1]}"
+            self.output_queue.put(
+                client_server_addr(self.client_endpoint, fe_endpoint, new_fe_id)
+            )
 
     def _network_worker(self) -> None:
         assert self.server_addr is not None
@@ -147,13 +160,26 @@ class DistributedClient:
                             return
                         raise
 
+                    fe_endpoint = f"{self.server_addr[0]}:{self.server_addr[1]}"
                     if first_attempt:
                         self.output_queue.put(
-                            request_sent(self.server_addr[0], current_id, value)
+                            request_sent(
+                                self.client_endpoint,
+                                fe_endpoint,
+                                current_id,
+                                value,
+                            )
                         )
                         first_attempt = False
                     else:
-                        self.output_queue.put(request_resent(current_id, value))
+                        self.output_queue.put(
+                            request_resent(
+                                self.client_endpoint,
+                                fe_endpoint,
+                                current_id,
+                                value,
+                            )
+                        )
 
                     ack = wait_for_ack(
                         self.sock,
@@ -171,15 +197,19 @@ class DistributedClient:
 
                     if ack.get("status") not in (STATUS_PROCESSED, STATUS_DUPLICATE):
                         self.output_queue.put(
-                            f"frontend_error request_id {current_id} "
-                            f"status {ack.get('status')}"
+                            client_frontend_error(
+                                self.client_endpoint,
+                                current_id,
+                                ack.get("status"),
+                            )
                         )
                         self.stop_event.set()
                         return
 
                     self.output_queue.put(
                         ack_received(
-                            self.server_addr[0],
+                            self.client_endpoint,
+                            fe_endpoint,
                             current_id,
                             value,
                             ack["seq_id"],
@@ -198,8 +228,12 @@ class DistributedClient:
         for attempt in range(1, STARTUP_DISCOVERY_ATTEMPTS + 1):
             t0 = time.monotonic()
             print(
-                f"discovery_attempt client_id {self.client_id} "
-                f"attempt {attempt}/{STARTUP_DISCOVERY_ATTEMPTS} port {self.port}",
+                client_discovery_attempt(
+                    self.client_endpoint,
+                    attempt,
+                    STARTUP_DISCOVERY_ATTEMPTS,
+                    self.port,
+                ),
                 flush=True,
             )
             try:
@@ -210,9 +244,14 @@ class DistributedClient:
                 )
                 elapsed = time.monotonic() - t0
                 print(
-                    f"discovery_result client_id {self.client_id} attempt {attempt} "
-                    f"status found frontend_id {fid} addr {addr[0]}:{addr[1]} "
-                    f"elapsed {elapsed:.3f}s",
+                    client_discovery_result(
+                        self.client_endpoint,
+                        attempt,
+                        "found",
+                        elapsed,
+                        frontend_id=fid,
+                        frontend_addr=f"{addr[0]}:{addr[1]}",
+                    ),
                     flush=True,
                 )
                 return addr, fid
@@ -220,8 +259,12 @@ class DistributedClient:
                 last_exc = exc
                 elapsed = time.monotonic() - t0
                 print(
-                    f"discovery_result client_id {self.client_id} attempt {attempt} "
-                    f"status not_found elapsed {elapsed:.3f}s",
+                    client_discovery_result(
+                        self.client_endpoint,
+                        attempt,
+                        "not_found",
+                        elapsed,
+                    ),
                     flush=True,
                 )
                 if attempt < STARTUP_DISCOVERY_ATTEMPTS:
@@ -233,15 +276,15 @@ class DistributedClient:
         try:
             self.server_addr, self.frontend_id = self._discover_initial_frontend()
         except RuntimeError as exc:
-            print(f"Erro: {exc}", file=sys.stderr)
+            print(
+                format_client_log(self.client_endpoint, f"error {exc}"),
+                file=sys.stderr,
+                flush=True,
+            )
             self.sock.close()
             return
 
-        server_ip = self.server_addr[0]
-
         self.output_thread.start()
-        self.output_queue.put(client_server_addr(server_ip, self.frontend_id))
-
         self.input_thread.start()
         self.network_thread.start()
 

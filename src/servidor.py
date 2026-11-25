@@ -23,7 +23,13 @@ from arquitetura import (
     RingTopology,
 )
 from descoberta import discover_frontend, respond_to_discovery
-from interface import server_processing_event, server_started
+from interface import (
+    format_fe_log,
+    format_rm_log,
+    now as now_str,
+    server_processing_event,
+    server_started,
+)
 from processamento import ClientState, ReplicatedSumState, RequestProcessor
 from protocolo import (
     STATUS_PROCESSED,
@@ -67,6 +73,10 @@ REGISTRATION_ATTEMPTS: Final[int] = 5
 STARTUP_DISCOVERY_ATTEMPTS: Final[int] = 2
 ELECTION_HOP_MAX_RETRIES: Final[int] = 1
 UINT64_MAX: Final[int] = (1 << 64) - 1
+
+
+def _log(message: str) -> None:
+    print(f"{now_str()} {message}", flush=True)
 
 
 def _local_ip_for(peer_ip: str = "127.0.0.1") -> str:
@@ -161,6 +171,9 @@ class FrontendServer:
                         last_seen=now,
                         status="active",
                     )
+
+    def _fe_log(self, message: str) -> None:
+        print(format_fe_log(message), flush=True)
 
     def _state_snapshot_payload(self) -> dict[str, Any]:
         clients_payload: dict[str, dict[str, int]] = {}
@@ -274,10 +287,9 @@ class FrontendServer:
             try:
                 self.sock.sendto(packet, (replica.host, replica.port))
             except OSError as exc:
-                print(
+                self._fe_log(
                     f"disseminate_failed seq_id {seq_id} node_id {replica.node_id} "
-                    f"error {exc}",
-                    flush=True,
+                    f"error {exc}"
                 )
         return len(replicas)
 
@@ -291,10 +303,9 @@ class FrontendServer:
         self.record_op(message, seq_id)
         active = self.disseminate(seq_id, message)
         target = self.cluster_config.quorum_target(active)
-        print(
+        self._fe_log(
             f"disseminated seq_id {seq_id} active_replicas {active} "
-            f"quorum_target {target}",
-            flush=True,
+            f"quorum_target {target}"
         )
 
         if target <= 0:
@@ -327,11 +338,10 @@ class FrontendServer:
         if not tracker.replied:
             self.sock.sendto(tracker.response, tracker.client_addr)
             tracker.replied = True
-        print(
+        self._fe_log(
             f"quorum_decision seq_id {tracker.seq_id} {reason} "
             f"num_reqs {tracker.expected_num_reqs} "
-            f"total_sum {tracker.expected_total_sum}",
-            flush=True,
+            f"total_sum {tracker.expected_total_sum}"
         )
 
     def drain_quorum(self) -> None:
@@ -383,21 +393,19 @@ class FrontendServer:
             if replica.status != "active":
                 replica.status = "active"
                 should_broadcast = True
-                print(
+                self._fe_log(
                     f"replica_recovered node_id {node_id} "
-                    f"active_replicas {len(self.active_replicas())}",
-                    flush=True,
+                    f"active_replicas {len(self.active_replicas())}"
                 )
 
             entry = self.op_log.get(last_applied)
             if entry is not None and (
                 num_reqs != entry["num_reqs"] or total_sum != entry["total_sum"]
             ):
-                print(
+                self._fe_log(
                     f"replica_divergence node_id {node_id} seq_id {last_applied} "
                     f"replica num_reqs {num_reqs} total_sum {total_sum} "
-                    f"expected num_reqs {entry['num_reqs']} total_sum {entry['total_sum']}",
-                    flush=True,
+                    f"expected num_reqs {entry['num_reqs']} total_sum {entry['total_sum']}"
                 )
 
             previous = self.replica_progress.get(node_id, 0)
@@ -443,10 +451,9 @@ class FrontendServer:
                 self.sock.sendto(packet, sender)
                 resent += 1
             if resent > 0 or unsatisfiable == 0:
-                print(
+                self._fe_log(
                     f"nack_handled node_id {node_id} resent {resent} "
-                    f"unsatisfiable {unsatisfiable}",
-                    flush=True,
+                    f"unsatisfiable {unsatisfiable}"
                 )
 
     def process_replica_heartbeat(
@@ -461,7 +468,6 @@ class FrontendServer:
         with self._lock:
             replica = self.registered_replicas.get(node_id)
             if replica is None:
-                # Permite recuperação imediata de RM que sobreviveu à troca de FE
                 replica = ReplicaDescriptor(
                     node_id=node_id,
                     host=sender[0],
@@ -472,10 +478,9 @@ class FrontendServer:
                 )
                 self.registered_replicas[node_id] = replica
                 should_broadcast = True
-                print(
+                self._fe_log(
                     f"replica_rejoined node_id {node_id} addr {sender[0]}:{sender[1]} "
-                    f"active_replicas {len(self.active_replicas())}",
-                    flush=True,
+                    f"active_replicas {len(self.active_replicas())}"
                 )
             elif replica.host != sender[0]:
                 return
@@ -487,10 +492,9 @@ class FrontendServer:
                 replica.status = "active"
                 if was_suspect:
                     should_broadcast = True
-                    print(
+                    self._fe_log(
                         f"replica_recovered node_id {node_id} "
-                        f"active_replicas {len(self.active_replicas())}",
-                        flush=True,
+                        f"active_replicas {len(self.active_replicas())}"
                     )
 
         self.sock.sendto(
@@ -514,12 +518,11 @@ class FrontendServer:
                     self.replica_progress.pop(replica.node_id, None)
                     changed = True
                     active_now = len(self.active_replicas())
-                    print(
+                    self._fe_log(
                         f"replica_failure_detected node_id {replica.node_id} "
                         f"last_seen_seconds {now - replica.last_seen:.3f} "
                         f"active_replicas {active_now} "
-                        f"quorum_target {self.cluster_config.quorum_target(active_now)}",
-                        flush=True,
+                        f"quorum_target {self.cluster_config.quorum_target(active_now)}"
                     )
 
             for tracker in list(self.quorum_trackers.values()):
@@ -569,18 +572,16 @@ class FrontendServer:
                 self.registered_replicas[node_id] = replica
                 active_now = len(self.active_replicas())
                 action = "registered" if is_new else "registration_refreshed"
-                print(
+                self._fe_log(
                     f"{action} replica_manager {node_id} "
                     f"addr {replica.host}:{replica.port} "
                     f"active_replicas {active_now} "
-                    f"quorum_target {self.cluster_config.quorum_target(active_now)}",
-                    flush=True,
+                    f"quorum_target {self.cluster_config.quorum_target(active_now)}"
                 )
                 if previous is not None and previous.host != sender[0]:
-                    print(
+                    self._fe_log(
                         f"replica_endpoint_changed node_id {node_id} "
-                        f"old_host {previous.host} new_host {sender[0]}",
-                        flush=True,
+                        f"old_host {previous.host} new_host {sender[0]}"
                     )
             else:
                 node_id = node_id if isinstance(node_id, str) else "invalid"
@@ -667,11 +668,10 @@ class FrontendServer:
         finally:
             self._executor.shutdown(wait=True)
             with self._lock:
-                print(
+                self._fe_log(
                     f"final_state frontend_id {self.frontend_id} "
                     f"num_reqs {self.processor.num_reqs} "
-                    f"total_sum {self.processor.total_sum}",
-                    flush=True,
+                    f"total_sum {self.processor.total_sum}"
                 )
             self.sock.close()
 
@@ -727,6 +727,9 @@ class ReplicaManagerNode:
         self._fe_failed_reported = False
         self._hop_seq = 0
         self._promoted_frontend: FrontendServer | None = None
+
+    def _rm_log(self, message: str) -> None:
+        print(format_rm_log(self.node_id, message), flush=True)
 
     def _ingest_members(self, members: list[Any]) -> None:
         rebuilt: list[RingNodeInfo] = [self.ring.self_info]
@@ -908,10 +911,9 @@ class ReplicaManagerNode:
             self._unsatisfiable_until.pop(nxt, None)
             self.state.apply(nxt, value, client_id=client_id, request_id=request_id)
             progressed = True
-            print(
-                f"applied node_id {self.node_id} seq_id {nxt} value {value} "
-                f"num_reqs {self.state.num_reqs} total_sum {self.state.total_sum}",
-                flush=True,
+            self._rm_log(
+                f"applied seq_id {nxt} value {value} "
+                f"num_reqs {self.state.num_reqs} total_sum {self.state.total_sum}"
             )
         if progressed:
             self.send_applied_ack()
@@ -944,11 +946,9 @@ class ReplicaManagerNode:
             make_replica_nack(self.node_id, self.frontend_id, missing),
             self.frontend_addr,
         )
-        print(
-            f"gap_detected node_id {self.node_id} last_applied "
-            f"{self.state.last_applied_seq_id} nack_missing "
-            f"{missing[0]}..{missing[-1]} count {len(missing)}",
-            flush=True,
+        self._rm_log(
+            f"gap_detected last_applied {self.state.last_applied_seq_id} "
+            f"nack_missing {missing[0]}..{missing[-1]} count {len(missing)}"
         )
 
     def handle_ordered_request(self, message: dict[str, Any]) -> None:
@@ -1002,11 +1002,10 @@ class ReplicaManagerNode:
             hop_index=self._hop_seq,
         )
         self.sock.sendto(packet, (target.ip, target.port))
-        print(
-            f"election_send node_id {self.node_id} to {target.node_id} "
-            f"({target.ip}:{target.port}) candidate {candidate.node_id} "
-            f"ip {candidate.ip} hop_offset {self.ring.hop_offset}",
-            flush=True,
+        self._rm_log(
+            f"election_send to {target.node_id} ({target.ip}:{target.port}) "
+            f"candidate {candidate.node_id} ip {candidate.ip} "
+            f"hop_offset {self.ring.hop_offset}"
         )
 
     def start_election(self) -> None:
@@ -1015,11 +1014,7 @@ class ReplicaManagerNode:
         self.ring.origin_id = self.node_id
         self.ring.hop_offset = 1
         self.ring.hop_retries = 0
-        print(
-            f"election_started node_id {self.node_id} algorithm ring_highest_ip "
-            f"ip {self.local_ip}",
-            flush=True,
-        )
+        self._rm_log(f"election_started algorithm ring_highest_ip ip {self.local_ip}")
         self._send_election_to_hop(self.ring.candidate, self.node_id)
 
     def _promote_to_frontend(self, leader_id: str, leader_port: int) -> bool:
@@ -1047,10 +1042,8 @@ class ReplicaManagerNode:
                 time.sleep(PROMOTE_BIND_RETRY_DELAY_SECONDS)
 
         if fe_sock is None:
-            print(
-                f"promote_bind_failed node_id {self.node_id} port {leader_port} "
-                f"error {last_exc}",
-                flush=True,
+            self._rm_log(
+                f"promote_bind_failed port {leader_port} error {last_exc}"
             )
             return False
 
@@ -1064,9 +1057,10 @@ class ReplicaManagerNode:
             existing_sock=fe_sock,
         )
         print(
-            f"promoted_to_frontend node_id {self.node_id} frontend_id {leader_id} "
-            f"port {leader_port} num_reqs {self.state.num_reqs} "
-            f"total_sum {self.state.total_sum}",
+            format_fe_log(
+                f"promoted_to_frontend frontend_id {leader_id} port {leader_port} "
+                f"num_reqs {self.state.num_reqs} total_sum {self.state.total_sum}"
+            ),
             flush=True,
         )
         return True
@@ -1085,10 +1079,9 @@ class ReplicaManagerNode:
             leader_port=self.frontend_addr[1],
             origin_id=self.node_id,
         )
-        print(
+        self._rm_log(
             f"new_leader_elected leader_id {winner.node_id} ip {winner.ip} "
-            f"port {self.frontend_addr[1]}",
-            flush=True,
+            f"port {self.frontend_addr[1]}"
         )
         if winner.node_id == self.node_id:
             promoted = self._promote_to_frontend(self.node_id, self.frontend_addr[1])
@@ -1143,13 +1136,11 @@ class ReplicaManagerNode:
             make_election_ack(self.node_id, origin_id, hop_index),
             sender,
         )
-        print(
-            f"election_received node_id {self.node_id} from {sender_id} "
-            f"candidate {candidate_id} ip {candidate_ip} origin {origin_id}",
-            flush=True,
+        self._rm_log(
+            f"election_received from {sender_id} candidate {candidate_id} "
+            f"ip {candidate_ip} origin {origin_id}"
         )
 
-        # Garante que tanto o remetente quanto o candidato estejam conhecidos no anel
         if sender_id != self.frontend_id:
             self.ring.upsert_member(sender_id, sender[0], sender[1])
         if candidate_id != self.frontend_id:
@@ -1222,10 +1213,8 @@ class ReplicaManagerNode:
         if already_known:
             return
 
-        print(
-            f"coordinator_recognized node_id {self.node_id} leader_id {leader_id} "
-            f"addr {leader_ip}:{leader_port}",
-            flush=True,
+        self._rm_log(
+            f"coordinator_recognized leader_id {leader_id} addr {leader_ip}:{leader_port}"
         )
 
         self._send_reregister_nonblocking()
@@ -1259,15 +1248,13 @@ class ReplicaManagerNode:
             self._send_election_to_hop(candidate, origin)
             return
 
-        print(
-            f"election_hop_timeout node_id {self.node_id} "
-            f"unreachable {failed_node.node_id} ({failed_node.ip}:{failed_node.port})",
-            flush=True,
+        self._rm_log(
+            f"election_hop_timeout unreachable {failed_node.node_id} "
+            f"({failed_node.ip}:{failed_node.port})"
         )
         self.ring.remove_member(failed_node.node_id)
         next_node = self.ring.skip_unresponsive_hop()
         if next_node is None or next_node.node_id == self.node_id:
-            # Se nenhum outro nó respondeu no anel, este RM assume como líder
             self._announce_coordinator(self.ring.self_info)
         else:
             self._send_election_to_hop(candidate, origin)
@@ -1275,11 +1262,9 @@ class ReplicaManagerNode:
     def run(self) -> None:
         try:
             self.register()
-            print(
-                f"role replica_manager node_id {self.node_id} "
-                f"frontend_id {self.frontend_id} listen_port {self.listen_port} "
-                "status registered data_plane active_replication",
-                flush=True,
+            self._rm_log(
+                f"registered frontend_id {self.frontend_id} "
+                f"listen_port {self.listen_port}"
             )
             interval = self.cluster_config.heartbeat_interval_seconds
             self.sock.settimeout(min(0.1, interval))
@@ -1303,11 +1288,9 @@ class ReplicaManagerNode:
                     ):
                         if not self._fe_failed_reported:
                             self._fe_failed_reported = True
-                            print(
-                                f"frontend_failure_detected node_id {self.node_id} "
-                                f"frontend_id {self.frontend_id} "
-                                f"elapsed {now - self._last_fe_contact:.3f}s",
-                                flush=True,
+                            self._rm_log(
+                                f"frontend_failure_detected frontend_id {self.frontend_id} "
+                                f"elapsed {now - self._last_fe_contact:.3f}s"
                             )
                         self.start_election()
 
@@ -1372,11 +1355,9 @@ class ReplicaManagerNode:
             pass
         finally:
             if self._promoted_frontend is None:
-                print(
-                    f"final_state node_id {self.node_id} "
-                    f"last_applied {self.state.last_applied_seq_id} "
-                    f"num_reqs {self.state.num_reqs} total_sum {self.state.total_sum}",
-                    flush=True,
+                self._rm_log(
+                    f"final_state last_applied {self.state.last_applied_seq_id} "
+                    f"num_reqs {self.state.num_reqs} total_sum {self.state.total_sum}"
                 )
                 self.sock.close()
 
@@ -1391,25 +1372,16 @@ class DistributedServer:
 
     def elect_frontend_ring_initial(self) -> bool:
         local_ip = _local_ip_for("127.0.0.1")
-        print(
-            f"election_started node_id {self.node_id} algorithm ring_highest_ip "
-            f"ip {local_ip}",
-            flush=True,
-        )
-        print(
-            f"election_result node_id {self.node_id} "
-            "role frontend decision ring_sole_candidate",
-            flush=True,
-        )
+        _log(f"election_started algorithm ring_highest_ip ip {local_ip}")
+        _log("election_result role frontend decision ring_sole_candidate")
         return True
 
     def _try_discover_frontend(self) -> tuple[tuple[str, int] | None, str]:
         for attempt in range(1, STARTUP_DISCOVERY_ATTEMPTS + 1):
             t0 = time.monotonic()
-            print(
-                f"discovery_attempt node_id {self.node_id} "
-                f"attempt {attempt}/{STARTUP_DISCOVERY_ATTEMPTS} port {self.port}",
-                flush=True,
+            _log(
+                f"discovery_attempt attempt {attempt}/{STARTUP_DISCOVERY_ATTEMPTS} "
+                f"port {self.port}"
             )
             discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -1421,19 +1393,16 @@ class DistributedServer:
                     self.node_id,
                 )
                 elapsed = time.monotonic() - t0
-                print(
-                    f"discovery_result node_id {self.node_id} attempt {attempt} "
-                    f"status found frontend_id {fid} addr {addr[0]}:{addr[1]} "
-                    f"elapsed {elapsed:.3f}s",
-                    flush=True,
+                _log(
+                    f"discovery_result attempt {attempt} status found "
+                    f"frontend_id {fid} addr {addr[0]}:{addr[1]} elapsed {elapsed:.3f}s"
                 )
                 return addr, fid
             except RuntimeError:
                 elapsed = time.monotonic() - t0
-                print(
-                    f"discovery_result node_id {self.node_id} attempt {attempt} "
-                    f"status not_found elapsed {elapsed:.3f}s",
-                    flush=True,
+                _log(
+                    f"discovery_result attempt {attempt} status not_found "
+                    f"elapsed {elapsed:.3f}s"
                 )
             finally:
                 discovery_sock.close()
@@ -1443,11 +1412,6 @@ class DistributedServer:
         frontend_addr, frontend_id = self._try_discover_frontend()
 
         if frontend_addr is not None:
-            print(
-                f"frontend_discovered frontend_id {frontend_id} "
-                f"addr {frontend_addr[0]}:{frontend_addr[1]}",
-                flush=True,
-            )
             ReplicaManagerNode(
                 self.node_id,
                 frontend_addr,
@@ -1464,18 +1428,9 @@ class DistributedServer:
                 cluster_config=self.cluster_config,
             )
         except OSError as exc:
-            print(
-                f"frontend_bind_busy node_id {self.node_id} port {self.port} "
-                f"error {exc}",
-                flush=True,
-            )
+            _log(f"frontend_bind_busy port {self.port} error {exc}")
             frontend_addr, frontend_id = self._try_discover_frontend()
             if frontend_addr is not None:
-                print(
-                    f"frontend_discovered frontend_id {frontend_id} "
-                    f"addr {frontend_addr[0]}:{frontend_addr[1]}",
-                    flush=True,
-                )
                 ReplicaManagerNode(
                     self.node_id,
                     frontend_addr,
@@ -1486,10 +1441,7 @@ class DistributedServer:
             raise
 
         self.elect_frontend_ring_initial()
-        print(
-            f"frontend_starting frontend_id {frontend_id} port {self.port}",
-            flush=True,
-        )
+        _log(f"frontend_starting frontend_id {frontend_id} port {self.port}")
         fe_server.run()
 
 

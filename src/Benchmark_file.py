@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark do serviço distribuído de soma sobre UDP usando números de arquivo de texto.
-
-Lê os valores a serem somados de um arquivo de texto (por padrão 'RAND_NUM_1.txt'),
-envia cada requisição respeitando o protocolo stop-and-wait (esperando o ACK correspondente)
-e valida o resultado final contra a soma acumulada esperada.
-
-Uso:
-    python3 Benchmark_file.py <porta_udp> [caminho_arquivo]
-
-Exemplo:
-    python3 Benchmark_file.py 4000 RAND_NUM_1.txt
-"""
+"""Benchmark do serviço distribuído de soma sobre UDP usando números de arquivo de texto."""
 
 from __future__ import annotations
 
@@ -22,6 +11,7 @@ import uuid
 from typing import Final, List, Optional
 
 from descoberta import discover_frontend
+from interface import client_server_addr, format_client_log
 from protocolo import (
     TYPE_SUM_RESULT,
     decode_message,
@@ -31,10 +21,6 @@ from protocolo import (
 BUFFER_SIZE: Final[int] = 4096
 REQUEST_TIMEOUT: Final[float] = 0.100
 REDISCOVER_AFTER_RETRIES: Final[int] = 5
-
-
-def now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def load_numbers_from_file(filepath: str) -> List[int]:
@@ -95,7 +81,6 @@ def wait_for_ack(
         ):
             return message
 
-        # Ignora respostas antigas/atrasadas.
         continue
 
 
@@ -119,31 +104,37 @@ def main() -> None:
 
     file_path = sys.argv[2] if len(sys.argv) == 3 else "RAND_NUM_1.txt"
 
-    print(f"Carregando números do arquivo: {file_path}")
     numbers = load_numbers_from_file(file_path)
     total_requests = len(numbers)
     expected_total_sum = sum(numbers)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.bind(("0.0.0.0", 0))
+
+    local_ip, local_port = sock.getsockname()
+    if local_ip == "0.0.0.0":
+        local_ip = "127.0.0.1"
+    client_endpoint = f"{local_ip}:{local_port}"
+
     client_id = uuid.uuid4().hex
 
     try:
         server_addr, frontend_id = discover_frontend(sock, port, client_id)
-        server_ip = server_addr[0]
+        fe_endpoint = f"{server_addr[0]}:{server_addr[1]}"
 
-        print(f"{now()} Servidor encontrado em {server_ip}:{server_addr[1]}")
-        print(f"Front-end: {frontend_id}")
-        print(f"Benchmark: {total_requests:,} requisições a serem enviadas.")
-        print(f"Soma esperada no conjunto de números: {expected_total_sum:,}")
-        print("Nota: O servidor deve ter sido iniciado zerado para validação exata.")
-        print("-" * 50)
+        print(client_server_addr(client_endpoint, fe_endpoint, frontend_id))
+        print(
+            format_client_log(
+                client_endpoint,
+                f"benchmark_file_start file {file_path} requests {total_requests:,} "
+                f"expected_sum {expected_total_sum:,}",
+            )
+        )
 
         start = time.perf_counter()
         last_ack = None
         retransmissions = 0
-
-        # Define frequência de logs de progresso (a cada 1.000 requisições ou a cada 10%)
         log_interval = max(1000, total_requests // 10)
 
         for req_id, value in enumerate(numbers, start=1):
@@ -171,9 +162,11 @@ def main() -> None:
                         if new_addr != server_addr or new_fe_id != frontend_id:
                             server_addr = new_addr
                             frontend_id = new_fe_id
+                            fe_endpoint = f"{server_addr[0]}:{server_addr[1]}"
                             print(
-                                f"{now()} Novo front-end: {server_addr[0]}:{server_addr[1]} "
-                                f"({frontend_id})",
+                                client_server_addr(
+                                    client_endpoint, fe_endpoint, frontend_id
+                                ),
                                 flush=True,
                             )
                     except RuntimeError:
@@ -183,10 +176,12 @@ def main() -> None:
                 elapsed = time.perf_counter() - start
                 rate = req_id / elapsed if elapsed > 0 else 0.0
                 print(
-                    f"{now()} Progresso {req_id:,}/{total_requests:,} "
-                    f"({(req_id / total_requests) * 100:.1f}%) | "
-                    f"Taxa: {rate:,.0f} req/s | "
-                    f"Retransmissões: {retransmissions}",
+                    format_client_log(
+                        client_endpoint,
+                        f"progresso {req_id:,}/{total_requests:,} "
+                        f"({(req_id / total_requests) * 100:.1f}%) "
+                        f"taxa {rate:,.0f} req/s retransmissoes {retransmissions}",
+                    ),
                     flush=True,
                 )
 
@@ -196,30 +191,21 @@ def main() -> None:
         received_num_reqs = last_ack.get("num_reqs") if last_ack else None
         received_total_sum = last_ack.get("total_sum") if last_ack else None
 
-        print()
-        print("=" * 20 + " RESULTADO DO BENCHMARK " + "=" * 20)
-        print(f"Tempo total decorrido: {elapsed:.3f} s")
-        print(f"Taxa média:            {rate:,.2f} req/s")
-        print(f"Retransmissões:        {retransmissions}")
-        print()
-        print(f"Esperado num_reqs:     {total_requests:,}")
-        print(f"Servidor num_reqs:     {received_num_reqs}")
-        print()
-        print(f"Esperado total_sum:    {expected_total_sum:,}")
-        print(f"Servidor total_sum:    {received_total_sum}")
-        print("=" * 64)
-
-        if (
+        ok = (
             received_num_reqs == total_requests
             and received_total_sum == expected_total_sum
-        ):
-            print(
-                "RESULTADO: OK! Todos os números foram processados e somados corretamente."
+        )
+        status_str = "OK" if ok else "FALHA"
+        print(
+            format_client_log(
+                client_endpoint,
+                f"benchmark_file_end status {status_str} elapsed {elapsed:.3f}s "
+                f"rate {rate:,.2f} req/s retransmissoes {retransmissions} "
+                f"num_reqs {received_num_reqs}/{total_requests} "
+                f"total_sum {received_total_sum}/{expected_total_sum}",
             )
-        else:
-            print(
-                "RESULTADO: DIVERGÊNCIA! Os valores retornados pelo servidor diferem do esperado."
-            )
+        )
+        if not ok:
             raise SystemExit(1)
 
     finally:

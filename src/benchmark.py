@@ -1,25 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark do serviço distribuído de soma sobre UDP.
-
-Envia 1 milhão de requisições automaticamente, respeitando o protocolo
-stop-and-wait: a próxima requisição só é enviada após o ACK da anterior.
-
-IMPORTANTE:
-    Para a comparação final ser direta, inicie o servidor zerado antes do
-    benchmark:
-
-        python3 servidor.py 4000
-        python3 benchmark.py 4000
-
-O benchmark usa value=1 em todas as requisições, portanto o resultado
-esperado é:
-    num_reqs  = 1_000_000
-    total_sum = 1_000_000
-
-Se a resposta for perdida ou o front-end falhar, a mesma requisição é
-retransmitida e o cliente redescobre o novo front-end após falhas consecutivas.
-O front-end deduplica por client_id/request_id para não somá-la duas vezes.
-"""
+"""Benchmark do serviço distribuído de soma sobre UDP."""
 
 from __future__ import annotations
 
@@ -30,6 +10,7 @@ import uuid
 from typing import Final
 
 from descoberta import discover_frontend
+from interface import client_server_addr, format_client_log
 from protocolo import (
     TYPE_SUM_RESULT,
     decode_message,
@@ -40,13 +21,8 @@ BUFFER_SIZE: Final[int] = 4096
 REQUEST_TIMEOUT: Final[float] = 0.100
 REDISCOVER_AFTER_RETRIES: Final[int] = 5
 
-# Um valor fixo facilita comparar execuções do benchmark.
 NUM_REQUESTS: Final[int] = 1_000_000
 VALUE: Final[int] = 1
-
-
-def now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def wait_for_ack(
@@ -80,9 +56,6 @@ def wait_for_ack(
         ):
             return message
 
-        # ACKs antigos podem chegar atrasados.
-        # ACK com id maior não deve ocorrer em um benchmark stop-and-wait
-        # normal; ele também não deve ser usado para confirmar a requisição.
         continue
 
 
@@ -103,16 +76,26 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.bind(("0.0.0.0", 0))
+
+    local_ip, local_port = sock.getsockname()
+    if local_ip == "0.0.0.0":
+        local_ip = "127.0.0.1"
+    client_endpoint = f"{local_ip}:{local_port}"
+
     client_id = uuid.uuid4().hex
 
     try:
         server_addr, frontend_id = discover_frontend(sock, port, client_id)
-        server_ip = server_addr[0]
+        fe_endpoint = f"{server_addr[0]}:{server_addr[1]}"
 
-        print(f"{now()} frontend_addr {server_ip} frontend_id {frontend_id}")
-        print(f"Benchmark: {NUM_REQUESTS:,} requisições, value={VALUE}")
-        print("O servidor deve ter sido iniciado zerado.")
-        print()
+        print(client_server_addr(client_endpoint, fe_endpoint, frontend_id))
+        print(
+            format_client_log(
+                client_endpoint,
+                f"benchmark_start requests {NUM_REQUESTS:,} value {VALUE}",
+            )
+        )
 
         expected_num_reqs = NUM_REQUESTS
         expected_total_sum = NUM_REQUESTS * VALUE
@@ -146,22 +129,26 @@ def main() -> None:
                         if new_addr != server_addr or new_fe_id != frontend_id:
                             server_addr = new_addr
                             frontend_id = new_fe_id
+                            fe_endpoint = f"{server_addr[0]}:{server_addr[1]}"
                             print(
-                                f"{now()} frontend_addr {server_addr[0]} "
-                                f"frontend_id {frontend_id}",
+                                client_server_addr(
+                                    client_endpoint, fe_endpoint, frontend_id
+                                ),
                                 flush=True,
                             )
                     except RuntimeError:
                         pass
 
-            # Mostra o progresso em intervalos para evitar milhões de linhas.
             if req_id % 100_000 == 0 or req_id == NUM_REQUESTS:
                 elapsed = time.perf_counter() - start
                 rate = req_id / elapsed if elapsed > 0 else 0.0
                 print(
-                    f"{now()} progresso {req_id:,}/{NUM_REQUESTS:,} "
-                    f"taxa {rate:,.0f} req/s "
-                    f"retransmissoes {retransmissions}",
+                    format_client_log(
+                        client_endpoint,
+                        f"progresso {req_id:,}/{NUM_REQUESTS:,} "
+                        f"taxa {rate:,.0f} req/s "
+                        f"retransmissoes {retransmissions}",
+                    ),
                     flush=True,
                 )
 
@@ -171,30 +158,21 @@ def main() -> None:
         received_num_reqs = last_ack.get("num_reqs") if last_ack else None
         received_total_sum = last_ack.get("total_sum") if last_ack else None
 
-        print()
-        print("========== RESULTADO ==========")
-        print(f"Tempo total:          {elapsed:.3f} s")
-        print(f"Taxa média:           {rate:,.2f} req/s")
-        print(f"Retransmissões:       {retransmissions}")
-        print()
-        print(f"Esperado num_reqs:    {expected_num_reqs}")
-        print(f"Servidor num_reqs:    {received_num_reqs}")
-        print()
-        print(f"Esperado total_sum:   {expected_total_sum}")
-        print(f"Servidor total_sum:   {received_total_sum}")
-        print()
-
         ok = (
             received_num_reqs == expected_num_reqs
             and received_total_sum == expected_total_sum
         )
-
-        if ok:
-            print("RESULTADO: OK")
-            print("O servidor processou corretamente 1 milhão de requisições.")
-        else:
-            print("RESULTADO: FALHA")
-            print("O resultado do servidor não corresponde ao esperado.")
+        status_str = "OK" if ok else "FALHA"
+        print(
+            format_client_log(
+                client_endpoint,
+                f"benchmark_end status {status_str} elapsed {elapsed:.3f}s "
+                f"rate {rate:,.2f} req/s retransmissoes {retransmissions} "
+                f"num_reqs {received_num_reqs}/{expected_num_reqs} "
+                f"total_sum {received_total_sum}/{expected_total_sum}",
+            )
+        )
+        if not ok:
             raise SystemExit(1)
 
     finally:
