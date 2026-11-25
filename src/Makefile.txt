@@ -1,0 +1,31 @@
+PYTHON := python3
+PORT ?= 4000
+FILE ?= src/RAND_NUM_1.txt
+
+.PHONY: all build check test server client benchmark benchmark-file clean
+
+all: check
+
+build: check
+
+check:
+	$(PYTHON) -m py_compile src/*.py tests/*.py
+
+test:
+	PYTHONPATH=src $(PYTHON) -m unittest discover -s tests -v
+
+server:
+	PYTHONPATH=src $(PYTHON) src/servidor.py $(PORT)
+
+client:
+	PYTHONPATH=src $(PYTHON) src/cliente.py $(PORT)
+
+benchmark:
+	PYTHONPATH=src $(PYTHON) src/benchmark.py $(PORT)
+
+benchmark-file:
+	PYTHONPATH=src $(PYTHON) src/Benchmark_file.py $(PORT) $(FILE)
+
+clean:
+	find src tests -type d -name "__pycache__" -exec rm -rf {} +
+	find src tests -type f -name "*.pyc" -delete
