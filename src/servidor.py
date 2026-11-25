@@ -21,8 +21,9 @@ from arquitetura import (
     ReplicaDescriptor,
     RingNodeInfo,
     RingTopology,
+    ip_priority_key,
 )
-from descoberta import discover_frontend, respond_to_discovery
+from descoberta import discover_frontend, get_local_ip, respond_to_discovery
 from interface import (
     format_fe_log,
     format_rm_log,
@@ -79,17 +80,10 @@ def _log(message: str) -> None:
     print(f"{now_str()} {message}", flush=True)
 
 
-def _local_ip_for(peer_ip: str = "127.0.0.1") -> str:
+def _local_ip_for(peer_ip: str = "8.8.8.8") -> str:
     if peer_ip in ("127.0.0.1", "localhost"):
-        return "127.0.0.1"
-    temp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        temp.connect((peer_ip, 1))
-        return temp.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        temp.close()
+        return get_local_ip("8.8.8.8")
+    return get_local_ip(peer_ip)
 
 
 class FrontendServer:
@@ -103,8 +97,10 @@ class FrontendServer:
         initial_state: ReplicatedSumState | None = None,
         initial_members: list[dict[str, Any]] | None = None,
         existing_sock: socket.socket | None = None,
+        host_ip: str | None = None,
     ) -> None:
         self.cluster_config = cluster_config or ClusterConfig()
+        self.host_ip = host_ip or _local_ip_for()
         if existing_sock is not None:
             self.sock = existing_sock
         else:
@@ -149,6 +145,7 @@ class FrontendServer:
         self.quorum_trackers: dict[int, QuorumTracker] = {}
         self.pending_order: deque[int] = deque()
         self.replica_progress: dict[str, int] = {}
+        self.yield_to_peer: tuple[tuple[str, int], str] | None = None
 
         if initial_members:
             now = time.monotonic()
@@ -235,7 +232,8 @@ class FrontendServer:
                 continue
 
     def process_discovery(self, sender: tuple[str, int]) -> None:
-        respond_to_discovery(self.sock, sender, self.frontend_id)
+        adv_ip = "127.0.0.1" if sender[0] == "127.0.0.1" else self.host_ip
+        respond_to_discovery(self.sock, sender, self.frontend_id, advertised_ip=adv_ip)
 
     def active_replicas(self) -> dict[str, ReplicaDescriptor]:
         now = time.monotonic()
@@ -621,6 +619,20 @@ class FrontendServer:
             self.process_replica_applied_ack(message, sender)
         elif message_type == TYPE_REPLICA_NACK:
             self.process_replica_nack(message, sender)
+        elif message_type == TYPE_COORDINATOR:
+            leader_id = message.get("leader_id")
+            leader_ip = message.get("leader_ip")
+            leader_port = message.get("leader_port")
+            if (
+                isinstance(leader_id, str)
+                and isinstance(leader_ip, str)
+                and isinstance(leader_port, int)
+                and leader_id != self.frontend_id
+                and ip_priority_key(leader_ip, leader_port, leader_id)
+                > ip_priority_key(self.host_ip, self.port, self.frontend_id)
+            ):
+                with self._lock:
+                    self.yield_to_peer = ((leader_ip, leader_port), leader_id)
         elif message_type == TYPE_ELECTION:
             origin_id = message.get("origin_id")
             hop_index = message.get("hop_index")
@@ -629,12 +641,11 @@ class FrontendServer:
                     make_election_ack(self.frontend_id, origin_id, hop_index),
                     sender,
                 )
-            local_ip = _local_ip_for(sender[0])
             self.sock.sendto(
                 make_coordinator(
                     self.frontend_id,
                     self.frontend_id,
-                    local_ip,
+                    self.host_ip,
                     self.port,
                     self.frontend_id,
                 ),
@@ -653,6 +664,9 @@ class FrontendServer:
         self.broadcast_ring_members()
         try:
             while True:
+                with self._lock:
+                    if self.yield_to_peer is not None:
+                        break
                 try:
                     data, sender = self.sock.recvfrom(BUFFER_SIZE)
                 except ConnectionResetError:
@@ -687,6 +701,7 @@ class ReplicaManagerNode:
         cluster_config: ClusterConfig,
         initial_state: ReplicatedSumState | None = None,
         initial_members: list[dict[str, Any]] | None = None,
+        host_ip: str | None = None,
     ) -> None:
         self.node_id = node_id
         self.frontend_addr = frontend_addr
@@ -702,7 +717,7 @@ class ReplicaManagerNode:
             self.sock.close()
             raise
 
-        self.local_ip = _local_ip_for(frontend_addr[0])
+        self.local_ip = host_ip or _local_ip_for(frontend_addr[0])
         self.ring = RingTopology(
             self_info=RingNodeInfo(
                 node_id=self.node_id,
@@ -1055,6 +1070,7 @@ class ReplicaManagerNode:
             initial_state=self.state,
             initial_members=members_data,
             existing_sock=fe_sock,
+            host_ip=self.local_ip,
         )
         print(
             format_fe_log(
@@ -1369,18 +1385,22 @@ class DistributedServer:
         self.port = port
         self.cluster_config = cluster_config
         self.node_id = f"server-{uuid.uuid4().hex[:12]}"
+        self.host_ip = _local_ip_for()
 
     def elect_frontend_ring_initial(self) -> bool:
-        local_ip = _local_ip_for("127.0.0.1")
-        _log(f"election_started algorithm ring_highest_ip ip {local_ip}")
+        _log(f"election_started algorithm ring_highest_ip ip {self.host_ip}")
         _log("election_result role frontend decision ring_sole_candidate")
         return True
 
-    def _try_discover_frontend(self) -> tuple[tuple[str, int] | None, str]:
-        for attempt in range(1, STARTUP_DISCOVERY_ATTEMPTS + 1):
+    def _try_discover_frontend(
+        self,
+        exclude_frontend_id: str | None = None,
+        max_attempts: int = STARTUP_DISCOVERY_ATTEMPTS,
+    ) -> tuple[tuple[str, int] | None, str]:
+        for attempt in range(1, max_attempts + 1):
             t0 = time.monotonic()
             _log(
-                f"discovery_attempt attempt {attempt}/{STARTUP_DISCOVERY_ATTEMPTS} "
+                f"discovery_attempt attempt {attempt}/{max_attempts} "
                 f"port {self.port}"
             )
             discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1391,6 +1411,7 @@ class DistributedServer:
                     discovery_sock,
                     self.port,
                     self.node_id,
+                    exclude_frontend_id=exclude_frontend_id,
                 )
                 elapsed = time.monotonic() - t0
                 _log(
@@ -1409,40 +1430,79 @@ class DistributedServer:
         return None, ""
 
     def run(self) -> None:
-        frontend_addr, frontend_id = self._try_discover_frontend()
-
-        if frontend_addr is not None:
-            ReplicaManagerNode(
-                self.node_id,
-                frontend_addr,
-                frontend_id,
-                self.cluster_config,
-            ).run()
-            return
-
-        frontend_id = f"frontend-{self.port}-{self.node_id}"
-        try:
-            fe_server = FrontendServer(
-                self.port,
-                frontend_id=frontend_id,
-                cluster_config=self.cluster_config,
-            )
-        except OSError as exc:
-            _log(f"frontend_bind_busy port {self.port} error {exc}")
+        while True:
             frontend_addr, frontend_id = self._try_discover_frontend()
+
             if frontend_addr is not None:
                 ReplicaManagerNode(
                     self.node_id,
                     frontend_addr,
                     frontend_id,
                     self.cluster_config,
+                    host_ip=self.host_ip,
                 ).run()
                 return
-            raise
 
-        self.elect_frontend_ring_initial()
-        _log(f"frontend_starting frontend_id {frontend_id} port {self.port}")
-        fe_server.run()
+            candidate_fe_id = f"frontend-{self.port}-{self.node_id}"
+            try:
+                fe_server = FrontendServer(
+                    self.port,
+                    frontend_id=candidate_fe_id,
+                    cluster_config=self.cluster_config,
+                    host_ip=self.host_ip,
+                )
+            except OSError as exc:
+                _log(f"frontend_bind_busy port {self.port} error {exc}")
+                frontend_addr, frontend_id = self._try_discover_frontend(max_attempts=2)
+                if frontend_addr is not None:
+                    ReplicaManagerNode(
+                        self.node_id,
+                        frontend_addr,
+                        frontend_id,
+                        self.cluster_config,
+                        host_ip=self.host_ip,
+                    ).run()
+                    return
+                raise
+
+            peer_addr, peer_fid = self._try_discover_frontend(
+                exclude_frontend_id=candidate_fe_id,
+                max_attempts=1,
+            )
+            if peer_addr is not None:
+                _log(
+                    f"frontend_conflict_resolved yielding to {peer_fid} "
+                    f"at {peer_addr[0]}:{peer_addr[1]}"
+                )
+                fe_server.sock.close()
+                ReplicaManagerNode(
+                    self.node_id,
+                    peer_addr,
+                    peer_fid,
+                    self.cluster_config,
+                    host_ip=self.host_ip,
+                ).run()
+                return
+
+            self.elect_frontend_ring_initial()
+            _log(f"frontend_starting frontend_id {candidate_fe_id} port {self.port}")
+            fe_server.run()
+
+            yield_target = fe_server.yield_to_peer
+            if yield_target is not None:
+                peer_addr, peer_fid = yield_target
+                _log(
+                    f"frontend_yielded to {peer_fid} at {peer_addr[0]}:{peer_addr[1]}"
+                )
+                ReplicaManagerNode(
+                    self.node_id,
+                    peer_addr,
+                    peer_fid,
+                    self.cluster_config,
+                    host_ip=self.host_ip,
+                ).run()
+                return
+            return
 
 
 def _is_uint(value: Any) -> bool:
